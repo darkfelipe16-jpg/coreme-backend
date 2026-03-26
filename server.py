@@ -47,7 +47,7 @@ app = FastAPI(
     redoc_url="/redoc",
     openapi_url="/openapi.json"
 )
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])
 async def root_test():
     return {"ok": True, "message": "root funcionando"}
 
