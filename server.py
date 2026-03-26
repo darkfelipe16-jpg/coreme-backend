@@ -1,3 +1,4 @@
+print("🚨 SERVER NOVO CARREGADO 🚨")
 import os
 import io
 import json
