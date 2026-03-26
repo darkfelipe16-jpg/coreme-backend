@@ -410,7 +410,7 @@ created_file = await upload_to_drive(
 )
 file_path = created_file["id"]
     # Create submission record
-    submission = Submission(
+submission = Submission(
         user_id=current_user["id"],
         user_name=current_user["full_name"],
         user_email=current_user["email"],
