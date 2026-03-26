@@ -422,7 +422,7 @@ submission = Submission(
         file_name=filename
     )
     
-    await db.submissions.insert_one(submission.dict())
+await db.submissions.insert_one(submission.dict())
     
     # Log the submission
     logger.info(f"Submission created: {current_user['full_name']} - {deadline_info['reference_month_name']}")
