@@ -6,17 +6,17 @@ import jwt
 import bcrypt
 import zipfile
 import logging
-import unicodedata
-import re
+import base64
 
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import List, Optional
 
+import aiofiles
 from dotenv import load_dotenv
 from fastapi import FastAPI, APIRouter, HTTPException, Depends, UploadFile, File, Query
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, Field, EmailStr
@@ -29,38 +29,27 @@ from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
 
-# MongoDB connection
 mongo_url = os.environ["MONGO_URL"]
 client = AsyncIOMotorClient(mongo_url)
 db = client[os.environ.get("DB_NAME", "coreme_uepa")]
 
-# JWT Configuration
 JWT_SECRET = os.environ.get("JWT_SECRET", "uepa_coreme_secret_key_2025")
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRATION_HOURS = 24
 
-# Optional local upload directory (kept only for compatibility/debug)
 UPLOAD_DIR = ROOT_DIR / "uploads" / "pdfs"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
-# Create the main app
 app = FastAPI(title="COREME UEPA - Sistema de Envio de PDF")
-
-# Create a router with the /api prefix
 api_router = APIRouter(prefix="/api")
-
-# Security
 security = HTTPBearer()
 
-# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
 
-
-# ==================== MODELS ====================
 
 class UserBase(BaseModel):
     email: EmailStr
@@ -111,7 +100,7 @@ class Submission(BaseModel):
     year: str
     reference_month: str
     reference_month_name: str
-    file_path: str   # agora guarda o file_id do Google Drive
+    file_path: str
     file_name: str
     submitted_at: datetime = Field(default_factory=datetime.utcnow)
 
@@ -149,7 +138,12 @@ class SystemConfigUpdate(BaseModel):
     institutional_message: Optional[str] = None
 
 
-# ==================== HELPERS ====================
+MONTH_NAMES_PT = {
+    1: "Janeiro", 2: "Fevereiro", 3: "Março", 4: "Abril",
+    5: "Maio", 6: "Junho", 7: "Julho", 8: "Agosto",
+    9: "Setembro", 10: "Outubro", 11: "Novembro", 12: "Dezembro"
+}
+
 
 def get_drive_service():
     creds_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
@@ -179,7 +173,7 @@ async def upload_to_drive(file_content: bytes, filename: str, mime_type: Optiona
 
     media = MediaIoBaseUpload(
         file_stream,
-        mimetype=mime_type or "application/octet-stream",
+        mimetype=mime_type or "application/pdf",
         resumable=True
     )
 
@@ -192,7 +186,7 @@ async def upload_to_drive(file_content: bytes, filename: str, mime_type: Optiona
     return created_file
 
 
-def download_drive_file(file_id: str) -> io.BytesIO:
+def download_from_drive(file_id: str) -> io.BytesIO:
     service = get_drive_service()
     request = service.files().get_media(fileId=file_id)
     buffer = io.BytesIO()
@@ -204,13 +198,6 @@ def download_drive_file(file_id: str) -> io.BytesIO:
 
     buffer.seek(0)
     return buffer
-
-
-MONTH_NAMES_PT = {
-    1: "Janeiro", 2: "Fevereiro", 3: "Março", 4: "Abril",
-    5: "Maio", 6: "Junho", 7: "Julho", 8: "Agosto",
-    9: "Setembro", 10: "Outubro", 11: "Novembro", 12: "Dezembro"
-}
 
 
 def hash_password(password: str) -> str:
@@ -289,13 +276,14 @@ def get_reference_month_info() -> dict:
 
 
 def sanitize_filename(name: str) -> str:
+    import re
+    import unicodedata
+
     name = unicodedata.normalize("NFKD", name).encode("ASCII", "ignore").decode("ASCII")
     name = re.sub(r"[^\w\s-]", "", name)
     name = re.sub(r"[\s]+", "", name)
     return name
 
-
-# ==================== AUTH ROUTES ====================
 
 @api_router.post("/auth/register", response_model=TokenResponse)
 async def register(user_data: UserCreate):
@@ -373,8 +361,6 @@ async def get_me(current_user: dict = Depends(get_current_user)):
     )
 
 
-# ==================== SUBMISSION ROUTES ====================
-
 @api_router.get("/submissions/deadline-info")
 async def get_deadline_info():
     return get_reference_month_info()
@@ -387,10 +373,7 @@ async def upload_pdf(
 ):
     deadline_info = get_reference_month_info()
     if not deadline_info["is_within_deadline"]:
-        raise HTTPException(
-            status_code=400,
-            detail="Prazo de envio encerrado. O envio é permitido apenas do dia 1 ao dia 4 de cada mês."
-        )
+        raise HTTPException(status_code=400, detail="Prazo de envio encerrado. O envio é permitido apenas do dia 1 ao dia 4 de cada mês.")
 
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Apenas arquivos PDF são aceitos")
@@ -486,8 +469,6 @@ async def check_submission(reference_month: str, current_user: dict = Depends(ge
     return {"submitted": existing is not None}
 
 
-# ==================== ADMIN ROUTES ====================
-
 @api_router.get("/admin/submissions", response_model=List[SubmissionResponse])
 async def get_all_submissions(
     reference_month: Optional[str] = None,
@@ -567,15 +548,12 @@ async def download_submission(submission_id: str, admin_user: dict = Depends(get
     if not submission:
         raise HTTPException(status_code=404, detail="Documento não encontrado")
 
-    try:
-        file_buffer = download_drive_file(submission["file_path"])
-    except Exception as e:
-        raise HTTPException(status_code=404, detail=f"Arquivo não encontrado no Google Drive: {str(e)}")
+    buffer = download_from_drive(submission["file_path"])
 
     return StreamingResponse(
-        file_buffer,
+        buffer,
         media_type="application/pdf",
-        headers={"Content-Disposition": f'attachment; filename="{submission["file_name"]}"'}
+        headers={"Content-Disposition": f"attachment; filename={submission['file_name']}"}
     )
 
 
@@ -617,7 +595,7 @@ async def export_excel(
     return StreamingResponse(
         buffer,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+        headers={"Content-Disposition": f"attachment; filename={filename}"}
     )
 
 
@@ -637,14 +615,11 @@ async def export_zip(
 
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
         for s in submissions:
-            try:
-                file_buffer = download_drive_file(s["file_path"])
-                sanitized_name = sanitize_filename(s["user_name"])
-                month_name_sanitized = sanitize_filename(s["reference_month_name"])
-                new_filename = f"{sanitized_name}_{month_name_sanitized}.pdf"
-                zf.writestr(new_filename, file_buffer.getvalue())
-            except Exception as e:
-                logger.warning(f"Falha ao adicionar arquivo {s.get('file_name')} ao ZIP: {str(e)}")
+            drive_buffer = download_from_drive(s["file_path"])
+            sanitized_name = sanitize_filename(s["user_name"])
+            month_name_sanitized = sanitize_filename(s["reference_month_name"])
+            new_filename = f"{sanitized_name}_{month_name_sanitized}.pdf"
+            zf.writestr(new_filename, drive_buffer.getvalue())
 
     buffer.seek(0)
 
@@ -654,11 +629,9 @@ async def export_zip(
     return StreamingResponse(
         buffer,
         media_type="application/zip",
-        headers={"Content-Disposition": f'attachment; filename="PDFs_{month_name}.zip"'}
+        headers={"Content-Disposition": f"attachment; filename=PDFs_{month_name}.zip"}
     )
 
-
-# ==================== SYSTEM CONFIG ROUTES ====================
 
 @api_router.get("/config")
 async def get_system_config():
@@ -686,6 +659,78 @@ async def update_system_config(
     return config
 
 
-# ==================== STATISTICS ====================
+@api_router.get("/admin/stats")
+async def get_stats(admin_user: dict = Depends(get_admin_user)):
+    total_users = await db.users.count_documents({"role": "resident"})
+    total_submissions = await db.submissions.count_documents({})
 
-@api_router
+    deadline_info = get_reference_month_info()
+    current_month_submissions = await db.submissions.count_documents({
+        "reference_month": deadline_info["reference_month"]
+    })
+
+    pipeline = [
+        {"$group": {"_id": "$program", "count": {"$sum": 1}}}
+    ]
+    by_program = await db.submissions.aggregate(pipeline).to_list(100)
+
+    return {
+        "total_users": total_users,
+        "total_submissions": total_submissions,
+        "current_month": deadline_info["reference_month_name"],
+        "current_month_submissions": current_month_submissions,
+        "is_within_deadline": deadline_info["is_within_deadline"],
+        "by_program": by_program
+    }
+
+
+@api_router.get("/")
+async def root():
+    return {"message": "COREME UEPA API", "status": "online"}
+
+
+@api_router.get("/health")
+async def health_check():
+    return {"status": "healthy", "timestamp": datetime.utcnow().isoformat()}
+
+
+app.include_router(api_router)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_credentials=True,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.on_event("startup")
+async def startup_db_client():
+    admin = await db.users.find_one({"email": "admin@uepa.br"})
+    if not admin:
+        admin_user = {
+            "id": str(uuid.uuid4()),
+            "email": "admin@uepa.br",
+            "full_name": "Administrador COREME",
+            "program": "Administração",
+            "year": "N/A",
+            "password": hash_password("admin123"),
+            "role": "admin",
+            "created_at": datetime.utcnow(),
+            "is_active": True
+        }
+        await db.users.insert_one(admin_user)
+        logger.info("Default admin user created: admin@uepa.br / admin123")
+
+    await db.users.create_index("email", unique=True)
+    await db.users.create_index("id")
+    await db.submissions.create_index([("user_id", 1), ("reference_month", 1)])
+    await db.submissions.create_index("reference_month")
+
+    logger.info("COREME UEPA API started successfully")
+
+
+@app.on_event("shutdown")
+async def shutdown_db_client():
+    client.close()
