@@ -40,7 +40,12 @@ JWT_EXPIRATION_HOURS = 24
 UPLOAD_DIR = ROOT_DIR / "uploads" / "pdfs"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="COREME UEPA - Sistema de Envio de PDF")
+app = FastAPI(
+    title="COREME UEPA - Sistema de Envio de PDF",
+    docs_url="/docs",
+    redoc_url="/redoc",
+    openapi_url="/openapi.json"
+)
 api_router = APIRouter(prefix="/api")
 security = HTTPBearer()
 
