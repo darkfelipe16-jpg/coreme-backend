@@ -139,6 +139,50 @@ class SystemConfigUpdate(BaseModel):
 
 # ==================== HELPERS ====================
 
+def get_drive_service():
+    creds_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+
+    if not creds_json:
+        raise Exception("Credenciais do Google não configuradas")
+
+    info = json.loads(creds_json)
+
+    credentials = service_account.Credentials.from_service_account_info(
+        info,
+        scopes=["https://www.googleapis.com/auth/drive"]
+    )
+
+    return build("drive", "v3", credentials=credentials)
+
+
+async def upload_to_drive(file_content, filename, mime_type):
+    service = get_drive_service()
+
+    folder_id = os.getenv("GOOGLE_DRIVE_FOLDER_ID")
+
+    if not folder_id:
+        raise Exception("GOOGLE_DRIVE_FOLDER_ID não configurado")
+
+    file_stream = io.BytesIO(file_content)
+
+    file_metadata = {
+        "name": filename,
+        "parents": [folder_id]
+    }
+
+    media = MediaIoBaseUpload(
+        file_stream,
+        mimetype=mime_type,
+        resumable=True
+    )
+
+    created_file = service.files().create(
+        body=file_metadata,
+        media_body=media,
+        fields="id,name"
+    ).execute()
+
+    return created_file
 MONTH_NAMES_PT = {
     1: "Janeiro", 2: "Fevereiro", 3: "Março", 4: "Abril",
     5: "Maio", 6: "Junho", 7: "Julho", 8: "Agosto",
@@ -182,7 +226,7 @@ async def get_admin_user(current_user: dict = Depends(get_current_user)) -> dict
     return current_user
 
 def get_reference_month_info() -> dict:
-    """
+    """            
     Calculates the reference month based on the "subsequent month rule":
     - Submissions from day 1-4 of current month refer to the PREVIOUS month
     """
@@ -358,10 +402,13 @@ async def upload_pdf(
         file_path = UPLOAD_DIR / filename
         counter += 1
     
-    # Save file
-    async with aiofiles.open(file_path, 'wb') as f:
-        await f.write(content)
-    
+ # Upload para Google Drive
+created_file = await upload_to_drive(
+    content,
+    filename,
+    file.content_type
+)
+file_path = created_file["id"]
     # Create submission record
     submission = Submission(
         user_id=current_user["id"],
