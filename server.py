@@ -46,6 +46,13 @@ app = FastAPI(
     redoc_url="/redoc",
     openapi_url="/openapi.json"
 )
+@app.get("/")
+async def root_test():
+    return {"ok": True, "message": "root funcionando"}
+
+@app.get("/ping")
+async def ping():
+    return {"ping": "pong"}
 api_router = APIRouter(prefix="/api")
 security = HTTPBearer()
 
