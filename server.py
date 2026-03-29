@@ -311,52 +311,58 @@ def sanitize_filename(name: str) -> str:
 
 @api_router.post("/auth/register", response_model=TokenResponse)
 async def register(user_data: UserCreate):
- existing = await db.users.find_one({"email": user_data.email.lower()})
-if existing:
-    raise HTTPException(status_code=400, detail="Email já cadastrado")
+    existing = await db.users.find_one({"email": user_data.email.lower()})
+    if existing:
+        raise HTTPException(status_code=400, detail="Email já cadastrado")
 
-if user_data.role == "resident":
-    if not user_data.year:
-        raise HTTPException(status_code=400, detail="Year obrigatório para residente")
-elif user_data.role == "preceptor":
-    if not user_data.cpf or not user_data.scenario:
-        raise HTTPException(status_code=400, detail="CPF e cenário obrigatórios para preceptor")
-elif user_data.role == "admin":
-    pass
-else:
-    raise HTTPException(status_code=400, detail="Role inválido")
+    if user_data.role == "resident":
+        if not user_data.year:
+            raise HTTPException(status_code=400, detail="Year obrigatório para residente")
 
-user_dict = {
-    "id": str(uuid.uuid4()),
-    "email": user_data.email.lower(),
-    "full_name": user_data.full_name,
-    "program": user_data.program,
-    "year": user_data.year,
-    "password": hash_password(user_data.password),
-    "role": user_data.role,
-    "cpf": user_data.cpf,
-    "scenario": user_data.scenario,
-    "created_at": datetime.utcnow(),
-    "is_active": True
-}
+    elif user_data.role == "preceptor":
+        # 👇 aqui decide se quer obrigar ou não
+        if not user_data.cpf or not user_data.scenario:
+            raise HTTPException(status_code=400, detail="CPF e cenário obrigatórios para preceptor")
+
+    elif user_data.role == "admin":
+        pass
+
+    else:
+        raise HTTPException(status_code=400, detail="Role inválido")
+
+    user_dict = {
+        "id": str(uuid.uuid4()),
+        "email": user_data.email.lower(),
+        "full_name": user_data.full_name,
+        "program": user_data.program,
+        "year": user_data.year,
+        "password": hash_password(user_data.password),
+        "role": user_data.role,
+        "cpf": user_data.cpf,
+        "scenario": user_data.scenario,
+        "created_at": datetime.utcnow(),
+        "is_active": True
+    }
+
     await db.users.insert_one(user_dict)
+
     token = create_token(user_dict["id"], user_dict["role"])
 
     return TokenResponse(
-    access_token=token,
-    user=UserResponse(
-        id=user_dict["id"],
-        email=user_dict["email"],
-        full_name=user_dict["full_name"],
-        program=user_dict["program"],
-        year=user_dict.get("year"),
-        role=user_dict["role"],
-        cpf=user_dict.get("cpf"),
-        scenario=user_dict.get("scenario"),
-        created_at=user_dict["created_at"],
-        is_active=user_dict["is_active"]
+        access_token=token,
+        user=UserResponse(
+            id=user_dict["id"],
+            email=user_dict["email"],
+            full_name=user_dict["full_name"],
+            program=user_dict["program"],
+            year=user_dict.get("year"),
+            role=user_dict["role"],
+            cpf=user_dict.get("cpf"),
+            scenario=user_dict.get("scenario"),
+            created_at=user_dict["created_at"],
+            is_active=user_dict["is_active"]
+        )
     )
-)
 
 
 @api_router.post("/auth/login", response_model=TokenResponse)
