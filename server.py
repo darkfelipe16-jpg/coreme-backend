@@ -68,11 +68,21 @@ class UserBase(BaseModel):
     email: EmailStr
     full_name: str
     program: str
-    year: str
+    year: Optional[str] = None
+    role: str = "resident"
+    cpf: Optional[str] = None
+    scenario: Optional[str] = None
 
 
-class UserCreate(UserBase):
+class UserCreate(BaseModel):
+    email: EmailStr
     password: str
+    full_name: str
+    program: str
+    year: Optional[str] = None
+    role: str
+    cpf: Optional[str] = None
+    scenario: Optional[str] = None
 
 
 class UserLogin(BaseModel):
@@ -82,7 +92,6 @@ class UserLogin(BaseModel):
 
 class User(UserBase):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    role: str = "resident"
     created_at: datetime = Field(default_factory=datetime.utcnow)
     is_active: bool = True
 
@@ -92,8 +101,10 @@ class UserResponse(BaseModel):
     email: str
     full_name: str
     program: str
-    year: str
+    year: Optional[str] = None
     role: str
+    cpf: Optional[str] = None
+    scenario: Optional[str] = None
     created_at: datetime
     is_active: bool
 
@@ -300,38 +311,52 @@ def sanitize_filename(name: str) -> str:
 
 @api_router.post("/auth/register", response_model=TokenResponse)
 async def register(user_data: UserCreate):
-    existing = await db.users.find_one({"email": user_data.email.lower()})
-    if existing:
-        raise HTTPException(status_code=400, detail="Email já cadastrado")
+ existing = await db.users.find_one({"email": user_data.email.lower()})
+if existing:
+    raise HTTPException(status_code=400, detail="Email já cadastrado")
 
-    user_dict = {
-        "id": str(uuid.uuid4()),
-        "email": user_data.email.lower(),
-        "full_name": user_data.full_name,
-        "program": user_data.program,
-        "year": user_data.year,
-        "password": hash_password(user_data.password),
-        "role": "resident",
-        "created_at": datetime.utcnow(),
-        "is_active": True
-    }
+if user_data.role == "resident":
+    if not user_data.year:
+        raise HTTPException(status_code=400, detail="Year obrigatório para residente")
+elif user_data.role == "preceptor":
+    if not user_data.cpf or not user_data.scenario:
+        raise HTTPException(status_code=400, detail="CPF e cenário obrigatórios para preceptor")
+elif user_data.role == "admin":
+    pass
+else:
+    raise HTTPException(status_code=400, detail="Role inválido")
 
+user_dict = {
+    "id": str(uuid.uuid4()),
+    "email": user_data.email.lower(),
+    "full_name": user_data.full_name,
+    "program": user_data.program,
+    "year": user_data.year,
+    "password": hash_password(user_data.password),
+    "role": user_data.role,
+    "cpf": user_data.cpf,
+    "scenario": user_data.scenario,
+    "created_at": datetime.utcnow(),
+    "is_active": True
+}
     await db.users.insert_one(user_dict)
     token = create_token(user_dict["id"], user_dict["role"])
 
     return TokenResponse(
-        access_token=token,
-        user=UserResponse(
-            id=user_dict["id"],
-            email=user_dict["email"],
-            full_name=user_dict["full_name"],
-            program=user_dict["program"],
-            year=user_dict["year"],
-            role=user_dict["role"],
-            created_at=user_dict["created_at"],
-            is_active=user_dict["is_active"]
-        )
+    access_token=token,
+    user=UserResponse(
+        id=user_dict["id"],
+        email=user_dict["email"],
+        full_name=user_dict["full_name"],
+        program=user_dict["program"],
+        year=user_dict.get("year"),
+        role=user_dict["role"],
+        cpf=user_dict.get("cpf"),
+        scenario=user_dict.get("scenario"),
+        created_at=user_dict["created_at"],
+        is_active=user_dict["is_active"]
     )
+)
 
 
 @api_router.post("/auth/login", response_model=TokenResponse)
@@ -346,32 +371,36 @@ async def login(credentials: UserLogin):
     token = create_token(user["id"], user["role"])
 
     return TokenResponse(
-        access_token=token,
-        user=UserResponse(
-            id=user["id"],
-            email=user["email"],
-            full_name=user["full_name"],
-            program=user.get("program", ""),
-            year=user.get("year", ""),
-            role=user["role"],
-            created_at=user["created_at"],
-            is_active=user.get("is_active", True)
-        )
+    access_token=token,
+    user=UserResponse(
+        id=user["id"],
+        email=user["email"],
+        full_name=user["full_name"],
+        program=user["program"],
+        year=user.get("year"),
+        role=user["role"],
+        cpf=user.get("cpf"),
+        scenario=user.get("scenario"),
+        created_at=user["created_at"],
+        is_active=user["is_active"]
     )
+)
 
 
 @api_router.get("/auth/me", response_model=UserResponse)
 async def get_me(current_user: dict = Depends(get_current_user)):
     return UserResponse(
-        id=current_user["id"],
-        email=current_user["email"],
-        full_name=current_user["full_name"],
-        program=current_user.get("program", ""),
-        year=current_user.get("year", ""),
-        role=current_user["role"],
-        created_at=current_user["created_at"],
-        is_active=current_user.get("is_active", True)
-    )
+    id=current_user["id"],
+    email=current_user["email"],
+    full_name=current_user["full_name"],
+    program=current_user.get("program", ""),
+    year=current_user.get("year"),
+    role=current_user.get("role", "resident"),
+    cpf=current_user.get("cpf"),
+    scenario=current_user.get("scenario"),
+    created_at=current_user["created_at"],
+    is_active=current_user.get("is_active", True)
+)
 
 
 @api_router.get("/submissions/deadline-info")
