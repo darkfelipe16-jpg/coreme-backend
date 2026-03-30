@@ -281,7 +281,9 @@ def get_reference_month_info() -> dict:
     reference_month_name = f"{MONTH_NAMES_PT[ref_month]} {ref_year}"
 
     deadline_day = 4
-    is_within_deadline = current_day <= deadline_day
+    
+    FORCE_UPLOAD_OPEN = True
+    is_within_deadline = FORCE_UPLOAD_OPEN or (current_day <= deadline_day)
 
     if is_within_deadline:
         deadline = datetime(now.year, now.month, deadline_day, 23, 59, 59)
