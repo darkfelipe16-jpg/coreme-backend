@@ -124,8 +124,16 @@ class Submission(BaseModel):
     year: str
     reference_month: str
     reference_month_name: str
+
     file_path: str
     file_name: str
+
+    aulas_file_path: Optional[str] = None
+    aulas_file_name: Optional[str] = None
+
+    orientacao_file_path: Optional[str] = None
+    orientacao_file_name: Optional[str] = None
+
     submitted_at: datetime = Field(default_factory=datetime.utcnow)
 
 
@@ -419,19 +427,41 @@ async def get_deadline_info():
 @api_router.post("/submissions/upload")
 async def upload_pdf(
     file: UploadFile = File(...),
+    aulas_ministradas_file: UploadFile = File(...),
+    orientacao_trabalho_file: UploadFile = File(...),
     current_user: dict = Depends(get_current_user)
 ):
     deadline_info = get_reference_month_info()
     if not deadline_info["is_within_deadline"]:
-        raise HTTPException(status_code=400, detail="Prazo de envio encerrado. O envio é permitido apenas do dia 1 ao dia 4 de cada mês.")
+        raise HTTPException(
+            status_code=400,
+            detail="Prazo de envio encerrado. O envio é permitido apenas do dia 1 ao dia 4 de cada mês."
+        )
 
-    if not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Apenas arquivos PDF são aceitos")
+    files_to_validate = [
+        ("Frequência", file),
+        ("Aulas Ministradas", aulas_ministradas_file),
+        ("Orientação de Trabalho", orientacao_trabalho_file),
+    ]
 
-    content = await file.read()
+    validated_files = {}
 
-    if len(content) > 10 * 1024 * 1024:
-        raise HTTPException(status_code=400, detail="Arquivo muito grande. Máximo permitido: 10MB")
+    for label, current_file in files_to_validate:
+        if not current_file.filename.lower().endswith(".pdf"):
+            raise HTTPException(
+                status_code=400,
+                detail=f"{label}: apenas arquivos PDF são aceitos"
+            )
+
+        content = await current_file.read()
+
+        if len(content) > 10 * 1024 * 1024:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{label}: arquivo muito grande. Máximo permitido: 10MB"
+            )
+
+        validated_files[label] = content
 
     reference_month = deadline_info["reference_month"]
 
@@ -447,44 +477,68 @@ async def upload_pdf(
 
     sanitized_name = sanitize_filename(current_user["full_name"])
     month_name_sanitized = sanitize_filename(deadline_info["reference_month_name"])
-    filename = f"{sanitized_name}_{month_name_sanitized}.pdf"
 
-    created_file = await upload_to_drive(
-        content,
-        filename,
+    frequencia_filename = f"{sanitized_name}_{month_name_sanitized}_frequencia.pdf"
+    aulas_filename = f"{sanitized_name}_{month_name_sanitized}_aulas.pdf"
+    orientacao_filename = f"{sanitized_name}_{month_name_sanitized}_orientacao.pdf"
+
+    frequencia_drive = await upload_to_drive(
+        validated_files["Frequência"],
+        frequencia_filename,
         file.content_type
     )
-    file_path = created_file["id"]
 
-    submission = Submission(
-        user_id=current_user["id"],
-        user_name=current_user["full_name"],
-        user_email=current_user["email"],
-        program=current_user.get("program", ""),
-        year=current_user.get("year", ""),
-        reference_month=reference_month,
-        reference_month_name=deadline_info["reference_month_name"],
-        file_path=str(file_path),
-        file_name=filename
+    aulas_drive = await upload_to_drive(
+        validated_files["Aulas Ministradas"],
+        aulas_filename,
+        aulas_ministradas_file.content_type
     )
 
-    await db.submissions.insert_one(submission.dict())
+    orientacao_drive = await upload_to_drive(
+        validated_files["Orientação de Trabalho"],
+        orientacao_filename,
+        orientacao_trabalho_file.content_type
+    )
+
+    submission = {
+        "id": str(uuid.uuid4()),
+        "user_id": current_user["id"],
+        "user_name": current_user["full_name"],
+        "user_email": current_user["email"],
+        "program": current_user.get("program", ""),
+        "year": current_user.get("year", ""),
+        "reference_month": reference_month,
+        "reference_month_name": deadline_info["reference_month_name"],
+        "submitted_at": datetime.utcnow(),
+
+        "file_path": str(frequencia_drive["id"]),
+        "file_name": frequencia_filename,
+
+        "aulas_file_path": str(aulas_drive["id"]),
+        "aulas_file_name": aulas_filename,
+
+        "orientacao_file_path": str(orientacao_drive["id"]),
+        "orientacao_file_name": orientacao_filename,
+    }
+
+    await db.submissions.insert_one(submission)
 
     logger.info(f"Submission created: {current_user['full_name']} - {deadline_info['reference_month_name']}")
 
     return {
-        "message": f"PDF enviado com sucesso para {deadline_info['reference_month_name']}",
-        "submission": SubmissionResponse(
-            id=submission.id,
-            user_id=submission.user_id,
-            user_name=submission.user_name,
-            user_email=submission.user_email,
-            program=submission.program,
-            year=submission.year,
-            reference_month=submission.reference_month,
-            reference_month_name=submission.reference_month_name,
-            submitted_at=submission.submitted_at
-        )
+        "message": f"PDFs enviados com sucesso para {deadline_info['reference_month_name']}",
+        "submission": {
+            "id": submission["id"],
+            "user_id": submission["user_id"],
+            "user_name": submission["user_name"],
+            "user_email": submission["user_email"],
+            "program": submission["program"],
+            "year": submission["year"],
+            "reference_month": submission["reference_month"],
+            "reference_month_name": submission["reference_month_name"],
+            "submitted_at": submission["submitted_at"],
+            "status": "Enviado"
+        }
     }
 
 
@@ -681,7 +735,77 @@ async def export_zip(
         media_type="application/zip",
         headers={"Content-Disposition": f"attachment; filename=PDFs_{month_name}.zip"}
     )
+@api_router.get("/admin/export-zip-aulas")
+async def export_zip_aulas(
+    reference_month: str = Query(..., description="Reference month in format YYYY-MM"),
+    admin_user: dict = Depends(get_admin_user)
+):
+    submissions = await db.submissions.find(
+        {"reference_month": reference_month}
+    ).sort("user_name", 1).to_list(10000)
 
+    if not submissions:
+        raise HTTPException(status_code=404, detail="Nenhum envio encontrado para este mês")
+
+    buffer = io.BytesIO()
+
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        for s in submissions:
+            if not s.get("aulas_file_path"):
+                continue
+
+            drive_buffer = download_from_drive(s["aulas_file_path"])
+            sanitized_name = sanitize_filename(s["user_name"])
+            month_name_sanitized = sanitize_filename(s["reference_month_name"])
+            new_filename = f"{sanitized_name}_{month_name_sanitized}_aulas.pdf"
+            zf.writestr(new_filename, drive_buffer.getvalue())
+
+    buffer.seek(0)
+
+    year, month_num = reference_month.split("-")
+    month_name = f"{MONTH_NAMES_PT[int(month_num)]}_{year}"
+
+    return StreamingResponse(
+        buffer,
+        media_type="application/zip",
+        headers={"Content-Disposition": f"attachment; filename=Aulas_{month_name}.zip"}
+    )
+
+@api_router.get("/admin/export-zip-orientacao")
+async def export_zip_orientacao(
+    reference_month: str = Query(..., description="Reference month in format YYYY-MM"),
+    admin_user: dict = Depends(get_admin_user)
+):
+    submissions = await db.submissions.find(
+        {"reference_month": reference_month}
+    ).sort("user_name", 1).to_list(10000)
+
+    if not submissions:
+        raise HTTPException(status_code=404, detail="Nenhum envio encontrado para este mês")
+
+    buffer = io.BytesIO()
+
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        for s in submissions:
+            if not s.get("orientacao_file_path"):
+                continue
+
+            drive_buffer = download_from_drive(s["orientacao_file_path"])
+            sanitized_name = sanitize_filename(s["user_name"])
+            month_name_sanitized = sanitize_filename(s["reference_month_name"])
+            new_filename = f"{sanitized_name}_{month_name_sanitized}_orientacao.pdf"
+            zf.writestr(new_filename, drive_buffer.getvalue())
+
+    buffer.seek(0)
+
+    year, month_num = reference_month.split("-")
+    month_name = f"{MONTH_NAMES_PT[int(month_num)]}_{year}"
+
+    return StreamingResponse(
+        buffer,
+        media_type="application/zip",
+        headers={"Content-Disposition": f"attachment; filename=Orientacao_{month_name}.zip"}
+    )
 
 @api_router.get("/config")
 async def get_system_config():
