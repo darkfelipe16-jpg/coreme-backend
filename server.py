@@ -424,19 +424,22 @@ async def get_deadline_info():
     return get_reference_month_info()
 
 
+from typing import Optional
+
 @api_router.post("/submissions/upload")
 async def upload_pdf(
-    file: UploadFile = File(...),
-    aulas_ministradas_file: UploadFile = File(...),
-    orientacao_trabalho_file: UploadFile = File(...),
+    file: Optional[UploadFile] = File(None),
+    aulas_ministradas_file: Optional[UploadFile] = File(None),
+    orientacao_trabalho_file: Optional[UploadFile] = File(None),
     current_user: dict = Depends(get_current_user)
 ):
-    deadline_info = get_reference_month_info()
-    if not deadline_info["is_within_deadline"]:
+    if not file or not aulas_ministradas_file or not orientacao_trabalho_file:
         raise HTTPException(
             status_code=400,
-            detail="Prazo de envio encerrado. O envio é permitido apenas do dia 1 ao dia 4 de cada mês."
+            detail="Todos os arquivos são obrigatórios"
         )
+
+    deadline_info = get_reference_month_info()
 
     files_to_validate = [
         ("Frequência", file),
@@ -462,18 +465,6 @@ async def upload_pdf(
             )
 
         validated_files[label] = content
-
-    reference_month = deadline_info["reference_month"]
-
-    existing = await db.submissions.find_one({
-        "user_id": current_user["id"],
-        "reference_month": reference_month
-    })
-    if existing:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Você já enviou um documento para {deadline_info['reference_month_name']}. Apenas 1 envio por mês é permitido."
-        )
 
     sanitized_name = sanitize_filename(current_user["full_name"])
     month_name_sanitized = sanitize_filename(deadline_info["reference_month_name"])
@@ -507,7 +498,7 @@ async def upload_pdf(
         "user_email": current_user["email"],
         "program": current_user.get("program", ""),
         "year": current_user.get("year", ""),
-        "reference_month": reference_month,
+        "reference_month": deadline_info["reference_month"],
         "reference_month_name": deadline_info["reference_month_name"],
         "submitted_at": datetime.utcnow(),
 
@@ -523,24 +514,7 @@ async def upload_pdf(
 
     await db.submissions.insert_one(submission)
 
-    logger.info(f"Submission created: {current_user['full_name']} - {deadline_info['reference_month_name']}")
-
-    return {
-        "message": f"PDFs enviados com sucesso para {deadline_info['reference_month_name']}",
-        "submission": {
-            "id": submission["id"],
-            "user_id": submission["user_id"],
-            "user_name": submission["user_name"],
-            "user_email": submission["user_email"],
-            "program": submission["program"],
-            "year": submission["year"],
-            "reference_month": submission["reference_month"],
-            "reference_month_name": submission["reference_month_name"],
-            "submitted_at": submission["submitted_at"],
-            "status": "Enviado"
-        }
-    }
-
+    return {"message": "Upload realizado com sucesso"}
 
 @api_router.get("/submissions/my-history", response_model=List[SubmissionResponse])
 async def get_my_submissions(current_user: dict = Depends(get_current_user)):
