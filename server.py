@@ -714,14 +714,14 @@ async def get_stats(admin_user: dict = Depends(get_admin_user)):
     total_users = await db.users.count_documents({"role": "resident"})
     total_preceptors = await db.users.count_documents({"role": "preceptor"})
     total_submissions = await db.submissions.count_documents({})
-# pegar todos os preceptores
-preceptors = await db.users.find({"role": "preceptor"}).to_list(None)
-preceptor_ids = [p["id"] for p in preceptors]
 
-# contar envios desses preceptores
-total_preceptor_submissions = await db.submissions.count_documents({
-    "user_id": {"$in": preceptor_ids}
-})
+    # 👇 AGORA CORRETO (INDENTADO)
+    preceptors = await db.users.find({"role": "preceptor"}).to_list(None)
+    preceptor_ids = [p["id"] for p in preceptors]
+
+    total_preceptor_submissions = await db.submissions.count_documents({
+        "user_id": {"$in": preceptor_ids}
+    })
 
     deadline_info = get_reference_month_info()
     current_month_submissions = await db.submissions.count_documents({
@@ -734,16 +734,15 @@ total_preceptor_submissions = await db.submissions.count_documents({
     by_program = await db.submissions.aggregate(pipeline).to_list(100)
 
     return {
-    "total_users": total_users,
-    "total_preceptors": total_preceptors,
-    "total_submissions": total_submissions,
-    "total_preceptor_submissions": total_preceptor_submissions,
-    "current_month": deadline_info["reference_month_name"],
-    "current_month_submissions": current_month_submissions,
-    "is_within_deadline": deadline_info["is_within_deadline"],
-    "by_program": by_program
+        "total_users": total_users,
+        "total_preceptors": total_preceptors,
+        "total_submissions": total_submissions,
+        "total_preceptor_submissions": total_preceptor_submissions,
+        "current_month": deadline_info["reference_month_name"],
+        "current_month_submissions": current_month_submissions,
+        "is_within_deadline": deadline_info["is_within_deadline"],
+        "by_program": by_program
 }
-
 
 @api_router.get("/")
 async def root():
