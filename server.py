@@ -715,7 +715,6 @@ async def get_stats(admin_user: dict = Depends(get_admin_user)):
     total_preceptors = await db.users.count_documents({"role": "preceptor"})
     total_submissions = await db.submissions.count_documents({})
 
-    # 👇 AGORA CORRETO (INDENTADO)
     preceptors = await db.users.find({"role": "preceptor"}).to_list(None)
     preceptor_ids = [p["id"] for p in preceptors]
 
@@ -742,8 +741,7 @@ async def get_stats(admin_user: dict = Depends(get_admin_user)):
         "current_month_submissions": current_month_submissions,
         "is_within_deadline": deadline_info["is_within_deadline"],
         "by_program": by_program
-}
-
+    }
 @api_router.get("/")
 async def root():
     return {"message": "COREME UEPA API", "status": "online"}
