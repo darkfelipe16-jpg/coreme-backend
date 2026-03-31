@@ -482,23 +482,30 @@ async def upload_pdf(
     aulas_filename = f"{sanitized_name}_{month_name_sanitized}_aulas.pdf"
     orientacao_filename = f"{sanitized_name}_{month_name_sanitized}_orientacao.pdf"
 
-    frequencia_drive = await upload_to_drive(
-        validated_files["Frequência"],
-        frequencia_filename,
-        file.content_type
-    )
+    try:
+        frequencia_drive = await upload_to_drive(
+            validated_files["Frequência"],
+            frequencia_filename,
+            file.content_type
+        )
 
-    aulas_drive = await upload_to_drive(
-        validated_files["Aulas Ministradas"],
-        aulas_filename,
-        aulas_ministradas_file.content_type
-    )
+        aulas_drive = await upload_to_drive(
+            validated_files["Aulas Ministradas"],
+            aulas_filename,
+            aulas_ministradas_file.content_type
+        )
 
-    orientacao_drive = await upload_to_drive(
-        validated_files["Orientação de Trabalho"],
-        orientacao_filename,
-        orientacao_trabalho_file.content_type
-    )
+        orientacao_drive = await upload_to_drive(
+            validated_files["Orientação de Trabalho"],
+            orientacao_filename,
+            orientacao_trabalho_file.content_type
+        )
+    except Exception as e:
+        logger.exception("Erro ao enviar arquivos para o Google Drive")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erro no upload para o Google Drive: {str(e)}"
+        )
 
     submission = {
         "id": str(uuid.uuid4()),
