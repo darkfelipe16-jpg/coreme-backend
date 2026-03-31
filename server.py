@@ -47,6 +47,16 @@ app = FastAPI(
     redoc_url="/redoc",
     openapi_url="/openapi.json"
 )
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # libera tudo (depois pode restringir)
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 @app.api_route("/", methods=["GET", "HEAD"])
 async def root_test():
     return {"ok": True, "message": "root funcionando"}
