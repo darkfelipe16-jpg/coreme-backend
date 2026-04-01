@@ -31,11 +31,10 @@ from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
 cloudinary.config(
-    cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME"),
-    api_key=os.getenv("CLOUDINARY_API_KEY"),
-    api_secret=os.getenv("CLOUDINARY_API_SECRET"),
     secure=True
 )
+print("CLOUDINARY_URL exists:", bool(os.getenv("CLOUDINARY_URL")))
+print("CLOUDINARY_CLOUD_NAME:", os.getenv("CLOUDINARY_CLOUD_NAME"))
 
 mongo_url = os.environ["MONGO_URL"]
 client = AsyncIOMotorClient(mongo_url)
@@ -337,11 +336,12 @@ def sanitize_filename(name: str) -> str:
 
 async def upload_to_cloudinary(file_content: bytes, filename: str):
     result = cloudinary.uploader.upload(
-        file_content,
-        resource_type="raw",
-        public_id=filename,
-        overwrite=True
-    )
+    file_content,
+    resource_type="raw",
+    folder="coreme_uploads",
+    public_id=filename,
+    overwrite=True
+)
 
     return result
 
