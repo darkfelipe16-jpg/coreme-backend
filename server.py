@@ -891,28 +891,33 @@ app.include_router(api_router)
 
 @app.on_event("startup")
 async def startup_db_client():
-    admin = await db.users.find_one({"email": "admin@uepa.br"})
-    if not admin:
-        admin_user = {
-            "id": str(uuid.uuid4()),
-            "email": "admin@uepa.br",
-            "full_name": "Administrador COREME",
-            "program": "Administração",
-            "year": "N/A",
-            "password": hash_password("admin123"),
-            "role": "admin",
-            "created_at": datetime.utcnow(),
-            "is_active": True
-        }
-        await db.users.insert_one(admin_user)
-        logger.info("Default admin user created: admin@uepa.br / admin123")
+    try:
+        admin = await db.users.find_one({"email": "admin@uepa.br"})
 
-    await db.users.create_index("email", unique=True)
-    await db.users.create_index("id")
-    await db.submissions.create_index([("user_id", 1), ("reference_month", 1)])
-    await db.submissions.create_index("reference_month")
+        if not admin:
+            admin_user = {
+                "id": str(uuid.uuid4()),
+                "email": "admin@uepa.br",
+                "full_name": "Administrador COREME",
+                "program": "Administração",
+                "year": "N/A",
+                "password": hash_password("admin123"),
+                "role": "admin",
+                "created_at": datetime.utcnow(),
+                "is_active": True
+            }
+            await db.users.insert_one(admin_user)
+            logger.info("Default admin user created: admin@uepa.br / admin123")
 
-    logger.info("COREME UEPA API started successfully")
+        await db.users.create_index("email", unique=True)
+        await db.users.create_index("id")
+        await db.submissions.create_index([("user_id", 1), ("reference_month", 1)])
+        await db.submissions.create_index("reference_month")
+
+        print("Banco conectado com sucesso")
+
+    except Exception as e:
+        print("Erro ao conectar no banco:", e)
 
 
 @app.on_event("shutdown")
