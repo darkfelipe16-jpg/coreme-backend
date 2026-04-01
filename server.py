@@ -1,4 +1,6 @@
 print("🚨 SERVER NOVO CARREGADO 🚨")
+import cloudinary
+import cloudinary.uploader
 import os
 import io
 import json
@@ -28,6 +30,12 @@ from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
+cloudinary.config(
+    cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME"),
+    api_key=os.getenv("CLOUDINARY_API_KEY"),
+    api_secret=os.getenv("CLOUDINARY_API_SECRET"),
+    secure=True
+)
 
 mongo_url = os.environ["MONGO_URL"]
 client = AsyncIOMotorClient(mongo_url)
@@ -327,6 +335,15 @@ def sanitize_filename(name: str) -> str:
     name = re.sub(r"[\s]+", "", name)
     return name
 
+async def upload_to_cloudinary(file_content: bytes, filename: str):
+    result = cloudinary.uploader.upload(
+        file_content,
+        resource_type="raw",
+        public_id=filename,
+        overwrite=True
+    )
+
+    return result
 
 @api_router.post("/auth/register", response_model=TokenResponse)
 async def register(user_data: UserCreate):
