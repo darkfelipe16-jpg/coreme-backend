@@ -500,28 +500,26 @@ async def upload_pdf(
     orientacao_filename = f"{sanitized_name}_{month_name_sanitized}_orientacao.pdf"
 
     try:
-        frequencia_drive = await upload_to_drive(
+        frequencia_cloud = await upload_to_cloudinary(
             validated_files["Frequência"],
-            frequencia_filename,
-            file.content_type
+            frequencia_filename
         )
 
-        aulas_drive = await upload_to_drive(
+        aulas_cloud = await upload_to_cloudinary(
             validated_files["Aulas Ministradas"],
-            aulas_filename,
-            aulas_ministradas_file.content_type
+            aulas_filename
         )
 
-        orientacao_drive = await upload_to_drive(
+        orientacao_cloud = await upload_to_cloudinary(
             validated_files["Orientação de Trabalho"],
-            orientacao_filename,
-            orientacao_trabalho_file.content_type
+            orientacao_filename
         )
+
     except Exception as e:
-        logger.exception("Erro ao enviar arquivos para o Google Drive")
+        logger.exception("Erro ao enviar para Cloudinary")
         raise HTTPException(
             status_code=500,
-            detail=f"Erro no upload para o Google Drive: {str(e)}"
+            detail=f"Erro no upload: {str(e)}"
         )
 
     submission = {
@@ -535,13 +533,13 @@ async def upload_pdf(
         "reference_month_name": deadline_info["reference_month_name"],
         "submitted_at": datetime.utcnow(),
 
-        "file_path": str(frequencia_drive["id"]),
+        "file_path": frequencia_cloud["secure_url"],
         "file_name": frequencia_filename,
 
-        "aulas_file_path": str(aulas_drive["id"]),
+        "aulas_file_path": aulas_cloud["secure_url"],
         "aulas_file_name": aulas_filename,
 
-        "orientacao_file_path": str(orientacao_drive["id"]),
+        "orientacao_file_path": orientacao_cloud["secure_url"],
         "orientacao_file_name": orientacao_filename,
     }
 
