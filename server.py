@@ -31,10 +31,11 @@ from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
 cloudinary.config(
+    cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME"),
+    api_key=os.getenv("CLOUDINARY_API_KEY"),
+    api_secret=os.getenv("CLOUDINARY_API_SECRET"),
     secure=True
 )
-print("CLOUDINARY_URL exists:", bool(os.getenv("CLOUDINARY_URL")))
-print("CLOUDINARY_CLOUD_NAME:", os.getenv("CLOUDINARY_CLOUD_NAME"))
 
 mongo_url = os.environ["MONGO_URL"]
 client = AsyncIOMotorClient(mongo_url)
@@ -334,15 +335,16 @@ def sanitize_filename(name: str) -> str:
     name = re.sub(r"[\s]+", "", name)
     return name
 
-async def upload_to_cloudinary(file_content: bytes, filename: str):
-    result = cloudinary.uploader.upload(
-    file_content,
-    resource_type="raw",
-    folder="coreme_uploads",
-    public_id=filename,
-    overwrite=True
-)
+def upload_to_cloudinary(file_content: bytes, filename: str):
+    print("Enviando para Cloudinary...")
 
+    result = cloudinary.uploader.upload(
+        file_content,
+        resource_type="auto",
+        folder="coreme_uploads"
+    )
+
+    print("Upload concluído")
     return result
 
 @api_router.post("/auth/register", response_model=TokenResponse)
@@ -499,18 +501,22 @@ async def upload_pdf(
     aulas_filename = f"{sanitized_name}_{month_name_sanitized}_aulas.pdf"
     orientacao_filename = f"{sanitized_name}_{month_name_sanitized}_orientacao.pdf"
 
+    frequencia_filename = ...
+    aulas_filename = ...
+    orientacao_filename = ...
+
     try:
-        frequencia_cloud = await upload_to_cloudinary(
+        frequencia_cloud = upload_to_cloudinary(
             validated_files["Frequência"],
             frequencia_filename
         )
 
-        aulas_cloud = await upload_to_cloudinary(
+        aulas_cloud = upload_to_cloudinary(
             validated_files["Aulas Ministradas"],
             aulas_filename
         )
 
-        orientacao_cloud = await upload_to_cloudinary(
+        orientacao_cloud = upload_to_cloudinary(
             validated_files["Orientação de Trabalho"],
             orientacao_filename
         )
