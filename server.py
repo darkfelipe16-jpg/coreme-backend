@@ -32,7 +32,7 @@ ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
 
 cloudinary.config(
-    cloud_name="dkfgplash",
+    cloud_name="dkfpglash",
     api_key="489862842735213",
     api_secret="D8e_IQZMDtRpq3FSpXCjMySIqBA",
     secure=True
