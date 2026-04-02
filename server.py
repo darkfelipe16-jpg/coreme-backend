@@ -165,7 +165,7 @@ class SubmissionResponse(BaseModel):
     user_name: str
     user_email: str
     program: str
-    year: str
+    year: Optional[str] = None
     reference_month: str
     reference_month_name: str
     submitted_at: datetime
@@ -535,7 +535,7 @@ async def upload_pdf(
         "user_name": current_user["full_name"],
         "user_email": current_user["email"],
         "program": current_user.get("program", ""),
-        "year": current_user.get("year", ""),
+        "year": current_user.get("year") or "",
         "reference_month": deadline_info["reference_month"],
         "reference_month_name": deadline_info["reference_month_name"],
         "submitted_at": datetime.utcnow(),
@@ -567,7 +567,7 @@ async def get_my_submissions(current_user: dict = Depends(get_current_user)):
             user_name=s["user_name"],
             user_email=s["user_email"],
             program=s.get("program", ""),
-            year=s.get("year", ""),
+            year=s.get("year") or "",
             reference_month=s["reference_month"],
             reference_month_name=s["reference_month_name"],
             submitted_at=s["submitted_at"]
