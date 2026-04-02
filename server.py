@@ -31,12 +31,11 @@ from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
 
-cloudinary.config(
-    cloudinary_url=os.getenv("CLOUDINARY_URL"),
-    secure=True
-)
+cloudinary.config(secure=True)
 
 print("CLOUDINARY_URL exists:", bool(os.getenv("CLOUDINARY_URL")))
+print("CLOUDINARY_URL value:", os.getenv("CLOUDINARY_URL"))
+print("Cloudinary config:", cloudinary.config().cloud_name)
 
 mongo_url = os.environ["MONGO_URL"]
 client = AsyncIOMotorClient(mongo_url)
