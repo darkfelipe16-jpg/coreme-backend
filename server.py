@@ -31,7 +31,12 @@ from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
 
-cloudinary.config(secure=True)
+cloudinary.config(
+    cloud_name="dkfgplash",
+    api_key="489862842735213",
+    api_secret="D8e_IQZMDtRpq3FSpXCjMySIqBA",
+    secure=True
+)
 
 print("CLOUDINARY_URL exists:", bool(os.getenv("CLOUDINARY_URL")))
 print("CLOUDINARY_URL value:", os.getenv("CLOUDINARY_URL"))
