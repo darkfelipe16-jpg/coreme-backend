@@ -8,6 +8,7 @@ import uuid
 import jwt
 import bcrypt
 import zipfile
+import requests
 import logging
 import base64
 
@@ -330,28 +331,50 @@ def get_reference_month_info() -> dict:
         "message": "Prazo de envio encerrado." if not is_within_deadline else f"Prazo: até dia {deadline_day} às 23:59"
     }
 
-
 def sanitize_filename(name: str) -> str:
     import re
     import unicodedata
 
     name = unicodedata.normalize("NFKD", name).encode("ASCII", "ignore").decode("ASCII")
     name = re.sub(r"[^\w\s-]", "", name)
-    name = re.sub(r"[\s]+", "", name)
-    return name
+    name = re.sub(r"[\s]+", "_", name)
+    return name.lower()
 
-def upload_to_cloudinary(file_content: bytes, filename: str):
+
+def get_user_type_folder(user: dict) -> str:
+    role = user.get("role", "").lower()
+    if role == "preceptor":
+        return "preceptores"
+    return "residentes"
+
+
+def generate_frequencia_folder(user: dict, reference_month: str) -> str:
+    user_type = get_user_type_folder(user)
+    return f"coreme/{user_type}/frequencia/{reference_month}"
+
+
+def generate_user_material_folder(user: dict, reference_month: str) -> str:
+    user_type = get_user_type_folder(user)
+    program = sanitize_filename(user.get("program", "sem_programa"))
+    full_name = sanitize_filename(user.get("full_name", "sem_nome"))
+    return f"coreme/{user_type}/{program}/{full_name}/{reference_month}"
+
+
+def upload_to_cloudinary(file_content: bytes, filename: str, folder: str, public_id: str):
     print("Enviando para Cloudinary...")
 
     result = cloudinary.uploader.upload(
         file_content,
-        resource_type="auto",
-        folder="coreme_uploads"
+        resource_type="raw",
+        folder=folder,
+        public_id=public_id,
+        display_name=filename,
+        overwrite=True
     )
 
     print("Upload concluído")
     return result
-
+    
 @api_router.post("/auth/register", response_model=TokenResponse)
 async def register(user_data: UserCreate):
     existing = await db.users.find_one({"email": user_data.email.lower()})
@@ -498,28 +521,44 @@ async def upload_pdf(
             )
 
         validated_files[label] = content
-
     sanitized_name = sanitize_filename(current_user["full_name"])
+    sanitized_program = sanitize_filename(current_user.get("program", "sem_programa"))
     month_name_sanitized = sanitize_filename(deadline_info["reference_month_name"])
 
-    frequencia_filename = f"{sanitized_name}_{month_name_sanitized}_frequencia.pdf"
+    frequencia_folder = generate_frequencia_folder(
+        current_user,
+        deadline_info["reference_month"]
+    )
+
+    material_folder = generate_user_material_folder(
+        current_user,
+        deadline_info["reference_month"]
+    )
+
+    frequencia_filename = f"{sanitized_name}_{sanitized_program}_{month_name_sanitized}_frequencia.pdf"
     aulas_filename = f"{sanitized_name}_{month_name_sanitized}_aulas.pdf"
     orientacao_filename = f"{sanitized_name}_{month_name_sanitized}_orientacao.pdf"
 
     try:
         frequencia_cloud = upload_to_cloudinary(
             validated_files["Frequência"],
-            frequencia_filename
+            frequencia_filename,
+            frequencia_folder,
+            f"{sanitized_name}_{sanitized_program}_frequencia"
         )
 
         aulas_cloud = upload_to_cloudinary(
             validated_files["Aulas Ministradas"],
-            aulas_filename
+            aulas_filename,
+            material_folder,
+            "aulas"
         )
 
         orientacao_cloud = upload_to_cloudinary(
             validated_files["Orientação de Trabalho"],
-            orientacao_filename
+            orientacao_filename,
+            material_folder,
+            "orientacao"
         )
 
     except Exception as e:
@@ -553,6 +592,7 @@ async def upload_pdf(
     await db.submissions.insert_one(submission)
 
     return {"message": "Upload realizado com sucesso"}
+
 
 @api_router.get("/submissions/my-history", response_model=List[SubmissionResponse])
 async def get_my_submissions(current_user: dict = Depends(get_current_user)):
@@ -664,7 +704,8 @@ async def download_submission(submission_id: str, admin_user: dict = Depends(get
     if not submission:
         raise HTTPException(status_code=404, detail="Documento não encontrado")
 
-    buffer = download_from_drive(submission["file_path"])
+    response = requests.get(submission["file_path"])
+    buffer = io.BytesIO(response.content)
 
     return StreamingResponse(
         buffer,
@@ -731,11 +772,12 @@ async def export_zip(
 
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
         for s in submissions:
-            drive_buffer = download_from_drive(s["file_path"])
             sanitized_name = sanitize_filename(s["user_name"])
             month_name_sanitized = sanitize_filename(s["reference_month_name"])
             new_filename = f"{sanitized_name}_{month_name_sanitized}.pdf"
-            zf.writestr(new_filename, drive_buffer.getvalue())
+
+            response = requests.get(s["file_path"])
+            zf.writestr(new_filename, response.content)
 
     buffer.seek(0)
 
@@ -766,11 +808,11 @@ async def export_zip_aulas(
             if not s.get("aulas_file_path"):
                 continue
 
-            drive_buffer = download_from_drive(s["aulas_file_path"])
+            response = requests.get(s["aulas_file_path"])
             sanitized_name = sanitize_filename(s["user_name"])
             month_name_sanitized = sanitize_filename(s["reference_month_name"])
             new_filename = f"{sanitized_name}_{month_name_sanitized}_aulas.pdf"
-            zf.writestr(new_filename, drive_buffer.getvalue())
+            zf.writestr(new_filename, response.content)
 
     buffer.seek(0)
 
@@ -802,11 +844,12 @@ async def export_zip_orientacao(
             if not s.get("orientacao_file_path"):
                 continue
 
-            drive_buffer = download_from_drive(s["orientacao_file_path"])
             sanitized_name = sanitize_filename(s["user_name"])
             month_name_sanitized = sanitize_filename(s["reference_month_name"])
             new_filename = f"{sanitized_name}_{month_name_sanitized}_orientacao.pdf"
-            zf.writestr(new_filename, drive_buffer.getvalue())
+
+            response = requests.get(s["orientacao_file_path"])
+            zf.writestr(new_filename, response.content)
 
     buffer.seek(0)
 
