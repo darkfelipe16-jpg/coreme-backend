@@ -506,10 +506,6 @@ async def upload_pdf(
     aulas_filename = f"{sanitized_name}_{month_name_sanitized}_aulas.pdf"
     orientacao_filename = f"{sanitized_name}_{month_name_sanitized}_orientacao.pdf"
 
-    frequencia_filename = ...
-    aulas_filename = ...
-    orientacao_filename = ...
-
     try:
         frequencia_cloud = upload_to_cloudinary(
             validated_files["Frequência"],
