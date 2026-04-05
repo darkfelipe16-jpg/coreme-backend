@@ -11,6 +11,12 @@ import zipfile
 import requests
 import logging
 import base64
+import numpy as np
+import cv2
+import pytesseract
+
+from pdf2image import convert_from_bytes
+from openpyxl.styles import PatternFill
 
 from pathlib import Path
 from datetime import datetime, timedelta
