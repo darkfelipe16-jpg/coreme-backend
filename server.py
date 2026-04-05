@@ -380,7 +380,157 @@ def upload_to_cloudinary(file_content: bytes, filename: str, folder: str, public
 
     print("Upload concluído")
     return result
-    
+
+
+TESSERACT_CMD = os.getenv("TESSERACT_CMD", "tesseract")
+pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
+
+MONTH_TOKENS_PT = {
+    1: ["janeiro", "jan"],
+    2: ["fevereiro", "fev"],
+    3: ["marco", "março", "mar"],
+    4: ["abril", "abr"],
+    5: ["maio", "mai"],
+    6: ["junho", "jun"],
+    7: ["julho", "jul"],
+    8: ["agosto", "ago"],
+    9: ["setembro", "set"],
+    10: ["outubro", "out"],
+    11: ["novembro", "nov"],
+    12: ["dezembro", "dez"],
+}
+
+
+def normalize_ocr_text(text: str) -> str:
+    if not text:
+        return ""
+
+    text = text.lower()
+    text = text.replace("ç", "c")
+    text = text.replace("á", "a").replace("à", "a").replace("ã", "a").replace("â", "a")
+    text = text.replace("é", "e").replace("ê", "e")
+    text = text.replace("í", "i")
+    text = text.replace("ó", "o").replace("ô", "o").replace("õ", "o")
+    text = text.replace("ú", "u")
+    return text
+
+
+def month_found_in_text(text: str, expected_month: int) -> bool:
+    clean = normalize_ocr_text(text)
+    tokens = MONTH_TOKENS_PT.get(expected_month, [])
+    return any(token in clean for token in tokens)
+
+
+def pil_to_cv2(pil_image):
+    img = np.array(pil_image)
+    if len(img.shape) == 2:
+        return img
+    return cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+
+
+def crop_relative_region(img, box):
+    """
+    box = (x1, y1, x2, y2) em proporção da imagem
+    """
+    h, w = img.shape[:2]
+    x1, y1, x2, y2 = box
+
+    x1 = max(0, min(w, int(x1 * w)))
+    x2 = max(0, min(w, int(x2 * w)))
+    y1 = max(0, min(h, int(y1 * h)))
+    y2 = max(0, min(h, int(y2 * h)))
+
+    return img[y1:y2, x1:x2]
+
+
+def detect_handwritten_mark(region_img, min_pixels=250):
+    if region_img is None or region_img.size == 0:
+        return False, 0
+
+    if len(region_img.shape) == 3:
+        gray = cv2.cvtColor(region_img, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = region_img.copy()
+
+    gray = cv2.GaussianBlur(gray, (5, 5), 0)
+    _, thresh = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY_INV)
+
+    kernel = np.ones((2, 2), np.uint8)
+    thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
+
+    pixels = cv2.countNonZero(thresh)
+    return pixels >= min_pixels, int(pixels)
+
+
+def analyze_frequency_pdf(pdf_bytes: bytes, reference_month_name: str):
+    """
+    Analisa apenas a FREQUÊNCIA:
+    - tenta localizar o mês esperado no OCR
+    - verifica se há marca gráfica na área do residente
+    - verifica se há marca gráfica na área do preceptor
+    """
+
+    result = {
+        "status": "ok",
+        "month_ok": True,
+        "resident_signature_ok": True,
+        "preceptor_signature_ok": True,
+        "issues": [],
+        "ocr_excerpt": "",
+        "resident_pixels": 0,
+        "preceptor_pixels": 0,
+    }
+
+    try:
+        pages = convert_from_bytes(pdf_bytes, dpi=200, first_page=1, last_page=1)
+    except Exception as e:
+        result["status"] = "pendente"
+        result["issues"].append(f"Falha ao converter PDF: {str(e)}")
+        return result
+
+    if not pages:
+        result["status"] = "pendente"
+        result["issues"].append("PDF sem páginas legíveis")
+        return result
+
+    first_page = pages[0]
+    text = pytesseract.image_to_string(first_page, lang="por")
+    result["ocr_excerpt"] = (text or "")[:500]
+
+    # mês esperado vem de "Março 2026", por exemplo
+    expected_month_name = normalize_ocr_text(reference_month_name.split()[0])
+    if expected_month_name not in normalize_ocr_text(text):
+        result["month_ok"] = False
+        result["issues"].append("Mês do documento não confere com a competência esperada")
+
+    img_cv = pil_to_cv2(first_page)
+
+    # áreas iniciais de teste - provavelmente vamos ajustar depois
+    resident_box = (0.05, 0.72, 0.48, 0.97)
+    preceptor_box = (0.52, 0.72, 0.97, 0.97)
+
+    resident_region = crop_relative_region(img_cv, resident_box)
+    preceptor_region = crop_relative_region(img_cv, preceptor_box)
+
+    resident_ok, resident_pixels = detect_handwritten_mark(resident_region)
+    preceptor_ok, preceptor_pixels = detect_handwritten_mark(preceptor_region)
+
+    result["resident_signature_ok"] = resident_ok
+    result["preceptor_signature_ok"] = preceptor_ok
+    result["resident_pixels"] = resident_pixels
+    result["preceptor_pixels"] = preceptor_pixels
+
+    if not resident_ok:
+        result["issues"].append("Campo de assinatura/rubrica do residente aparenta estar vazio")
+
+    if not preceptor_ok:
+        result["issues"].append("Campo de assinatura/rubrica do preceptor aparenta estar vazio")
+
+    if result["issues"]:
+        result["status"] = "pendente"
+
+    return result
+
 @api_router.post("/auth/register", response_model=TokenResponse)
 async def register(user_data: UserCreate):
     existing = await db.users.find_one({"email": user_data.email.lower()})
@@ -485,10 +635,9 @@ async def get_me(current_user: dict = Depends(get_current_user)):
 async def get_deadline_info():
     return get_reference_month_info()
 
-
-from typing import Optional
-
 @api_router.post("/submissions/upload")
+
+
 async def upload_pdf(
     file: Optional[UploadFile] = File(None),
     aulas_ministradas_file: Optional[UploadFile] = File(None),
@@ -527,6 +676,11 @@ async def upload_pdf(
             )
 
         validated_files[label] = content
+
+    ocr_analysis = analyze_frequency_pdf(
+        validated_files["Frequência"],
+        deadline_info["reference_month_name"]
+    )
     sanitized_name = sanitize_filename(current_user["full_name"])
     sanitized_program = sanitize_filename(current_user.get("program", "sem_programa"))
     month_name_sanitized = sanitize_filename(deadline_info["reference_month_name"])
@@ -593,11 +747,20 @@ async def upload_pdf(
 
         "orientacao_file_path": orientacao_cloud["secure_url"],
         "orientacao_file_name": orientacao_filename,
+        
+        "ocr_status": ocr_analysis["status"],
+        "ocr_issues": ocr_analysis["issues"],
+        "ocr_analysis": ocr_analysis,
     }
 
     await db.submissions.insert_one(submission)
 
-    return {"message": "Upload realizado com sucesso"}
+    return {
+        "message": "Upload realizado com sucesso",
+        "ocr_status": ocr_analysis["status"],
+        "ocr_issues": ocr_analysis["issues"],
+        "ocr_analysis": ocr_analysis
+    }
 
 
 @api_router.get("/submissions/my-history", response_model=List[SubmissionResponse])
@@ -738,16 +901,26 @@ async def export_excel(
     headers = ["Nome", "Email", "Programa", "Ano", "Mês de Referência", "Status", "Data e Hora do Envio"]
     ws.append(headers)
 
+    red_fill = PatternFill(fill_type="solid", fgColor="FFC7CE")
+
     for s in submissions:
+        status_excel = "Pendente OCR" if s.get("ocr_status") == "pendente" else "Enviado"
+
         ws.append([
             s["user_name"],
             s["user_email"],
             s.get("program", ""),
             s.get("year", ""),
             s["reference_month_name"],
-            "Enviado",
+            status_excel,
             s["submitted_at"].strftime("%d/%m/%Y %H:%M:%S")
         ])
+
+        current_row = ws.max_row
+
+        if s.get("ocr_status") == "pendente":
+            for col in range(1, 8):
+                ws.cell(row=current_row, column=col).fill = red_fill
 
     buffer = io.BytesIO()
     wb.save(buffer)
