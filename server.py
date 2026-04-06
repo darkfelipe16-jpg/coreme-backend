@@ -14,6 +14,9 @@ import base64
 import numpy as np
 import cv2
 import pytesseract
+import os
+
+pytesseract.pytesseract.tesseract_cmd = "/usr/bin/tesseract"
 
 from pdf2image import convert_from_bytes
 from openpyxl.styles import PatternFill
