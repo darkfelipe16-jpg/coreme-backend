@@ -640,76 +640,89 @@ async def get_deadline_info():
     return get_reference_month_info()
 
 @api_router.post("/submissions/upload")
-
-
 async def upload_pdf(
     file: Optional[UploadFile] = File(None),
     aulas_ministradas_file: Optional[UploadFile] = File(None),
     orientacao_trabalho_file: Optional[UploadFile] = File(None),
     current_user: dict = Depends(get_current_user)
 ):
-    if not file or not aulas_ministradas_file or not orientacao_trabalho_file:
-        raise HTTPException(
-            status_code=400,
-            detail="Todos os arquivos são obrigatórios"
+    try:
+        print("=== INICIO UPLOAD ===")
+        print("file:", file.filename if file else None)
+        print("aulas:", aulas_ministradas_file.filename if aulas_ministradas_file else None)
+        print("orientacao:", orientacao_trabalho_file.filename if orientacao_trabalho_file else None)
+        print("usuario:", current_user.get("email"))
+
+        if not file or not aulas_ministradas_file or not orientacao_trabalho_file:
+            raise HTTPException(
+                status_code=400,
+                detail="Todos os arquivos são obrigatórios"
+            )
+
+        deadline_info = get_reference_month_info()
+        print("deadline_info:", deadline_info)
+
+        files_to_validate = [
+            ("Frequência", file),
+            ("Aulas Ministradas", aulas_ministradas_file),
+            ("Orientação de Trabalho", orientacao_trabalho_file),
+        ]
+
+        validated_files = {}
+
+        for label, current_file in files_to_validate:
+            print("Processando:", label, current_file.filename)
+
+            if not current_file.filename.lower().endswith(".pdf"):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{label}: apenas arquivos PDF são aceitos"
+                )
+
+            content = await current_file.read()
+            print(f"{label} tamanho:", len(content))
+
+            if len(content) > 10 * 1024 * 1024:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{label}: arquivo muito grande. Máximo permitido: 10MB"
+                )
+
+            validated_files[label] = content
+
+        print("Iniciando OCR da frequência")
+        ocr_analysis = analyze_frequency_pdf(
+            validated_files["Frequência"],
+            deadline_info["reference_month_name"]
+        )
+        print("OCR resultado:", ocr_analysis)
+
+        sanitized_name = sanitize_filename(current_user["full_name"])
+        sanitized_program = sanitize_filename(current_user.get("program", "sem_programa"))
+        month_name_sanitized = sanitize_filename(deadline_info["reference_month_name"])
+
+        frequencia_folder = generate_frequencia_folder(
+            current_user,
+            deadline_info["reference_month"]
         )
 
-    deadline_info = get_reference_month_info()
+        material_folder = generate_user_material_folder(
+            current_user,
+            deadline_info["reference_month"]
+        )
 
-    files_to_validate = [
-        ("Frequência", file),
-        ("Aulas Ministradas", aulas_ministradas_file),
-        ("Orientação de Trabalho", orientacao_trabalho_file),
-    ]
+        frequencia_filename = f"{sanitized_name}_{sanitized_program}_{month_name_sanitized}_frequencia.pdf"
+        aulas_filename = f"{sanitized_name}_{month_name_sanitized}_aulas.pdf"
+        orientacao_filename = f"{sanitized_name}_{month_name_sanitized}_orientacao.pdf"
 
-    validated_files = {}
-
-    for label, current_file in files_to_validate:
-        if not current_file.filename.lower().endswith(".pdf"):
-            raise HTTPException(
-                status_code=400,
-                detail=f"{label}: apenas arquivos PDF são aceitos"
-            )
-
-        content = await current_file.read()
-
-        if len(content) > 10 * 1024 * 1024:
-            raise HTTPException(
-                status_code=400,
-                detail=f"{label}: arquivo muito grande. Máximo permitido: 10MB"
-            )
-
-        validated_files[label] = content
-
-    ocr_analysis = analyze_frequency_pdf(
-        validated_files["Frequência"],
-        deadline_info["reference_month_name"]
-    )
-    sanitized_name = sanitize_filename(current_user["full_name"])
-    sanitized_program = sanitize_filename(current_user.get("program", "sem_programa"))
-    month_name_sanitized = sanitize_filename(deadline_info["reference_month_name"])
-
-    frequencia_folder = generate_frequencia_folder(
-        current_user,
-        deadline_info["reference_month"]
-    )
-
-    material_folder = generate_user_material_folder(
-        current_user,
-        deadline_info["reference_month"]
-    )
-
-    frequencia_filename = f"{sanitized_name}_{sanitized_program}_{month_name_sanitized}_frequencia.pdf"
-    aulas_filename = f"{sanitized_name}_{month_name_sanitized}_aulas.pdf"
-    orientacao_filename = f"{sanitized_name}_{month_name_sanitized}_orientacao.pdf"
-
-    try:
+        print("Iniciando upload Cloudinary da frequência")
         frequencia_cloud = upload_to_cloudinary(
             validated_files["Frequência"],
             frequencia_filename,
             frequencia_folder,
             f"{sanitized_name}_{sanitized_program}_frequencia"
         )
+        print("Upload frequência OK")
 
         aulas_cloud = upload_to_cloudinary(
             validated_files["Aulas Ministradas"],
@@ -717,6 +730,7 @@ async def upload_pdf(
             material_folder,
             "aulas"
         )
+        print("Upload aulas OK")
 
         orientacao_cloud = upload_to_cloudinary(
             validated_files["Orientação de Trabalho"],
@@ -724,48 +738,55 @@ async def upload_pdf(
             material_folder,
             "orientacao"
         )
+        print("Upload orientação OK")
+
+        submission = {
+            "id": str(uuid.uuid4()),
+            "user_id": current_user["id"],
+            "user_name": current_user["full_name"],
+            "user_email": current_user["email"],
+            "program": current_user.get("program", ""),
+            "year": current_user.get("year") or "",
+            "reference_month": deadline_info["reference_month"],
+            "reference_month_name": deadline_info["reference_month_name"],
+            "submitted_at": datetime.utcnow(),
+
+            "file_path": frequencia_cloud["secure_url"],
+            "file_name": frequencia_filename,
+
+            "aulas_file_path": aulas_cloud["secure_url"],
+            "aulas_file_name": aulas_filename,
+
+            "orientacao_file_path": orientacao_cloud["secure_url"],
+            "orientacao_file_name": orientacao_filename,
+
+            "ocr_status": ocr_analysis["status"],
+            "ocr_issues": ocr_analysis["issues"],
+            "ocr_analysis": ocr_analysis,
+        }
+
+        print("Salvando submission no Mongo")
+        await db.submissions.insert_one(submission)
+        print("Submission salva com sucesso")
+        print("=== FIM UPLOAD ===")
+
+        return {
+            "message": "Upload realizado com sucesso",
+            "ocr_status": ocr_analysis["status"],
+            "ocr_issues": ocr_analysis["issues"],
+            "ocr_analysis": ocr_analysis
+        }
+
+    except HTTPException:
+        raise
 
     except Exception as e:
-        logger.exception("Erro ao enviar para Cloudinary")
+        print("ERRO GERAL NO UPLOAD:", str(e))
+        logger.exception("ERRO GERAL NO UPLOAD")
         raise HTTPException(
             status_code=500,
-            detail=f"Erro no upload: {str(e)}"
+            detail=f"Erro interno no upload: {str(e)}"
         )
-
-    submission = {
-        "id": str(uuid.uuid4()),
-        "user_id": current_user["id"],
-        "user_name": current_user["full_name"],
-        "user_email": current_user["email"],
-        "program": current_user.get("program", ""),
-        "year": current_user.get("year") or "",
-        "reference_month": deadline_info["reference_month"],
-        "reference_month_name": deadline_info["reference_month_name"],
-        "submitted_at": datetime.utcnow(),
-
-        "file_path": frequencia_cloud["secure_url"],
-        "file_name": frequencia_filename,
-
-        "aulas_file_path": aulas_cloud["secure_url"],
-        "aulas_file_name": aulas_filename,
-
-        "orientacao_file_path": orientacao_cloud["secure_url"],
-        "orientacao_file_name": orientacao_filename,
-        
-        "ocr_status": ocr_analysis["status"],
-        "ocr_issues": ocr_analysis["issues"],
-        "ocr_analysis": ocr_analysis,
-    }
-
-    await db.submissions.insert_one(submission)
-
-    return {
-        "message": "Upload realizado com sucesso",
-        "ocr_status": ocr_analysis["status"],
-        "ocr_issues": ocr_analysis["issues"],
-        "ocr_analysis": ocr_analysis
-    }
-
 
 @api_router.get("/submissions/my-history", response_model=List[SubmissionResponse])
 async def get_my_submissions(current_user: dict = Depends(get_current_user)):
