@@ -136,6 +136,10 @@ class UserLogin(BaseModel):
     email: EmailStr
     password: str
 
+class CoremeCreate(BaseModel):
+    name: str
+    email: EmailStr
+    password: str
 
 class User(UserBase):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
@@ -1148,6 +1152,60 @@ async def root():
 async def health_check():
     return {"status": "healthy", "timestamp": datetime.utcnow().isoformat()}
 
+
+
+@api_router.post("/admin/coremes")
+async def create_coreme(
+    coreme_data: CoremeCreate,
+    admin_user: dict = Depends(get_admin_user)
+):
+    existing = await db.users.find_one({"email": coreme_data.email.lower()})
+    if existing:
+        raise HTTPException(status_code=400, detail="E-mail já cadastrado")
+
+    coreme_user = {
+        "id": str(uuid.uuid4()),
+        "email": coreme_data.email.lower(),
+        "full_name": coreme_data.name,
+        "program": "COREME",
+        "year": "N/A",
+        "password": hash_password(coreme_data.password),
+        "role": "coreme",
+        "cpf": None,
+        "scenario": None,
+        "created_at": datetime.utcnow(),
+        "is_active": True,
+    }
+
+    await db.users.insert_one(coreme_user)
+
+    return {
+        "message": "Perfil COREME criado com sucesso",
+        "coreme": {
+            "id": coreme_user["id"],
+            "name": coreme_user["full_name"],
+            "email": coreme_user["email"],
+            "role": coreme_user["role"],
+            "is_active": coreme_user["is_active"],
+        }
+    }
+
+
+@api_router.get("/admin/coremes")
+async def list_coremes(admin_user: dict = Depends(get_admin_user)):
+    coremes = await db.users.find({"role": "coreme"}).sort("full_name", 1).to_list(10000)
+
+    return [
+        {
+            "id": c["id"],
+            "name": c.get("full_name", ""),
+            "email": c.get("email", ""),
+            "role": c.get("role", "coreme"),
+            "created_at": c.get("created_at"),
+            "is_active": c.get("is_active", True),
+        }
+        for c in coremes
+    ]
 
 app.include_router(api_router)
 
