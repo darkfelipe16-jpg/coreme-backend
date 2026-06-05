@@ -1,4 +1,4 @@
-print("🚨 SERVER NOVO CARREGADO 🚨")
+print("🚨 ARTHUR FELIPE F. MARTINS 🚨")
 import cloudinary
 import cloudinary.uploader
 import os
@@ -71,14 +71,25 @@ app = FastAPI(
 )
 from fastapi.middleware.cors import CORSMiddleware
 
+# CORS - libera o frontend local e pode liberar o domínio publicado via variável de ambiente.
+# No Render, você pode criar a variável FRONTEND_URL com o link do frontend publicado.
+frontend_url = os.getenv("FRONTEND_URL", "").strip()
+
+allowed_origins = [
+    "http://localhost:8081",
+    "http://127.0.0.1:8081",
+    "http://localhost:19006",
+    "http://127.0.0.1:19006",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+]
+
+if frontend_url:
+    allowed_origins.append(frontend_url)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:8081",
-        "http://127.0.0.1:8081",
-        "http://localhost:19006",
-        "http://127.0.0.1:19006",
-    ],
+    allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
