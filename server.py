@@ -137,7 +137,8 @@ class UserLogin(BaseModel):
     password: str
 
 class CoremeCreate(BaseModel):
-    name: str
+    name: Optional[str] = None
+    full_name: Optional[str] = None
     email: EmailStr
     password: str
 
@@ -1159,6 +1160,14 @@ async def create_coreme(
     coreme_data: CoremeCreate,
     admin_user: dict = Depends(get_admin_user)
 ):
+    coreme_name = (coreme_data.name or coreme_data.full_name or "").strip()
+
+    if not coreme_name:
+        raise HTTPException(status_code=400, detail="Nome da COREME é obrigatório")
+
+    if len(coreme_data.password) < 6:
+        raise HTTPException(status_code=400, detail="A senha deve ter pelo menos 6 caracteres")
+
     existing = await db.users.find_one({"email": coreme_data.email.lower()})
     if existing:
         raise HTTPException(status_code=400, detail="E-mail já cadastrado")
@@ -1166,7 +1175,7 @@ async def create_coreme(
     coreme_user = {
         "id": str(uuid.uuid4()),
         "email": coreme_data.email.lower(),
-        "full_name": coreme_data.name,
+        "full_name": coreme_name,
         "program": "COREME",
         "year": "N/A",
         "password": hash_password(coreme_data.password),
