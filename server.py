@@ -148,6 +148,13 @@ class CoremeCreate(BaseModel):
     email: EmailStr
     password: str
 
+class CoremeConfirmationAtestoResponse(BaseModel):
+    id: str
+    reference_month: str
+    atesto_file_path: Optional[str] = None
+    atesto_file_name: Optional[str] = None
+    confirmed_at: Optional[datetime] = None
+
 class User(UserBase):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     created_at: datetime = Field(default_factory=datetime.utcnow)
@@ -331,6 +338,31 @@ async def get_admin_user(current_user: dict = Depends(get_current_user)) -> dict
     if current_user.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Acesso negado. Apenas administradores.")
     return current_user
+
+async def get_coreme_user(current_user: dict = Depends(get_current_user)) -> dict:
+    if current_user.get("role") != "coreme":
+        raise HTTPException(status_code=403, detail="Acesso negado. Apenas COREME.")
+    return current_user
+
+
+def get_submission_deadline(reference_month: str) -> datetime:
+    year, month = [int(part) for part in reference_month.split("-")]
+    if month == 12:
+        deadline_year = year + 1
+        deadline_month = 1
+    else:
+        deadline_year = year
+        deadline_month = month + 1
+
+    return datetime(deadline_year, deadline_month, 4, 23, 59, 59)
+
+
+def get_delivery_status(submitted_at: Optional[datetime], reference_month: str) -> str:
+    if not submitted_at:
+        return "not_delivered"
+
+    deadline = get_submission_deadline(reference_month)
+    return "delivered_on_time" if submitted_at <= deadline else "delivered_late"
 
 
 def get_reference_month_info() -> dict:
@@ -862,6 +894,9 @@ async def get_all_submissions(
 ):
     query = {}
 
+    if not reference_month:
+        reference_month = get_reference_month_info()["reference_month"]
+
     if reference_month:
         query["reference_month"] = reference_month
     if program:
@@ -918,6 +953,11 @@ async def get_programs(admin_user: dict = Depends(get_admin_user)):
 @api_router.get("/admin/reference-months")
 async def get_reference_months(admin_user: dict = Depends(get_admin_user)):
     months = await db.submissions.distinct("reference_month")
+
+    current_reference = get_reference_month_info()["reference_month"]
+    if current_reference not in months:
+        months.append(current_reference)
+
     months_sorted = sorted(months, reverse=True)
 
     result = []
@@ -926,7 +966,7 @@ async def get_reference_months(admin_user: dict = Depends(get_admin_user)):
         month_name = f"{MONTH_NAMES_PT[int(month_num)]} {year}"
         result.append({"value": m, "label": month_name})
 
-    return {"months": result}
+    return {"months": result, "current_reference_month": current_reference}
 
 
 @api_router.get("/admin/download/{submission_id}")
@@ -1235,6 +1275,230 @@ async def list_coremes(admin_user: dict = Depends(get_admin_user)):
     ]
 
 
+
+@api_router.get("/coreme/dashboard")
+async def get_coreme_dashboard(
+    reference_month: Optional[str] = None,
+    coreme_user: dict = Depends(get_coreme_user)
+):
+    deadline_info = get_reference_month_info()
+    if not reference_month:
+        reference_month = deadline_info["reference_month"]
+
+    year, month_num = reference_month.split("-")
+    reference_month_name = f"{MONTH_NAMES_PT[int(month_num)]} {year}"
+
+    coreme_name = coreme_user.get("full_name", "")
+
+    linked_users = await db.users.find({
+        "role": {"$in": ["resident", "preceptor"]},
+        "coreme": coreme_name,
+        "is_active": True
+    }).sort("full_name", 1).to_list(10000)
+
+    linked_ids = [u["id"] for u in linked_users]
+
+    submissions = await db.submissions.find({
+        "reference_month": reference_month,
+        "user_id": {"$in": linked_ids}
+    }).to_list(10000)
+
+    submissions_by_user = {s["user_id"]: s for s in submissions}
+
+    people = []
+    delivered_on_time = 0
+    delivered_late = 0
+    not_delivered = 0
+
+    for u in linked_users:
+        submission = submissions_by_user.get(u["id"])
+        submitted_at = submission.get("submitted_at") if submission else None
+        status = get_delivery_status(submitted_at, reference_month)
+
+        if status == "delivered_on_time":
+            delivered_on_time += 1
+        elif status == "delivered_late":
+            delivered_late += 1
+        else:
+            not_delivered += 1
+
+        people.append({
+            "id": u["id"],
+            "full_name": u.get("full_name", ""),
+            "email": u.get("email", ""),
+            "role": u.get("role", ""),
+            "program": u.get("program", ""),
+            "year": u.get("year"),
+            "scenario": u.get("scenario"),
+            "submitted_at": submitted_at.isoformat() if submitted_at else None,
+            "status": status,
+        })
+
+    confirmation = await db.coreme_confirmations.find_one({
+        "coreme_id": coreme_user["id"],
+        "reference_month": reference_month
+    })
+
+    return {
+        "reference_month": reference_month,
+        "reference_month_name": reference_month_name,
+        "coreme_name": coreme_name,
+        "confirmation_status": "confirmed" if confirmation else "pending",
+        "confirmed_at": confirmation.get("confirmed_at").isoformat() if confirmation and confirmation.get("confirmed_at") else None,
+        "atesto_file_path": confirmation.get("atesto_file_path") if confirmation else None,
+        "atesto_file_name": confirmation.get("atesto_file_name") if confirmation else None,
+        "total_linked": len(linked_users),
+        "delivered_on_time": delivered_on_time,
+        "delivered_late": delivered_late,
+        "not_delivered": not_delivered,
+        "people": people,
+    }
+
+
+@api_router.post("/coreme/monthly-confirmation")
+async def confirm_coreme_month(
+    reference_month: str = Query(...),
+    atesto_file: UploadFile = File(...),
+    coreme_user: dict = Depends(get_coreme_user)
+):
+    if not atesto_file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="O atesto precisa ser enviado em PDF")
+
+    content = await atesto_file.read()
+
+    if len(content) > 10 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="Arquivo muito grande. Máximo permitido: 10MB")
+
+    dashboard = await get_coreme_dashboard(reference_month=reference_month, coreme_user=coreme_user)
+
+    if dashboard["delivered_on_time"] == 0:
+        raise HTTPException(
+            status_code=400,
+            detail="Não há residentes ou preceptores com entrega dentro do prazo para atestar neste mês"
+        )
+
+    sanitized_coreme = sanitize_filename(coreme_user.get("full_name", "coreme"))
+    sanitized_month = sanitize_filename(reference_month)
+    atesto_filename = f"{sanitized_coreme}_{sanitized_month}_atesto_coreme.pdf"
+
+    atesto_cloud = upload_to_cloudinary(
+        content,
+        atesto_filename,
+        f"coreme/atestados/{sanitized_coreme}/{reference_month}",
+        f"{sanitized_coreme}_{sanitized_month}_atesto"
+    )
+
+    confirmation = {
+        "id": str(uuid.uuid4()),
+        "coreme_id": coreme_user["id"],
+        "coreme_name": coreme_user.get("full_name", ""),
+        "reference_month": reference_month,
+        "confirmed_at": datetime.utcnow(),
+        "confirmed_by": coreme_user.get("email", ""),
+        "atesto_file_path": atesto_cloud["secure_url"],
+        "atesto_file_name": atesto_filename,
+        "delivered_on_time": dashboard["delivered_on_time"],
+        "delivered_late": dashboard["delivered_late"],
+        "not_delivered": dashboard["not_delivered"],
+        "total_linked": dashboard["total_linked"],
+    }
+
+    await db.coreme_confirmations.update_one(
+        {
+            "coreme_id": coreme_user["id"],
+            "reference_month": reference_month
+        },
+        {"$set": confirmation},
+        upsert=True
+    )
+
+    return await get_coreme_dashboard(reference_month=reference_month, coreme_user=coreme_user)
+
+
+@api_router.get("/coreme/atesto")
+async def download_coreme_atesto(
+    reference_month: str = Query(...),
+    coreme_user: dict = Depends(get_coreme_user)
+):
+    confirmation = await db.coreme_confirmations.find_one({
+        "coreme_id": coreme_user["id"],
+        "reference_month": reference_month
+    })
+
+    if not confirmation or not confirmation.get("atesto_file_path"):
+        raise HTTPException(status_code=404, detail="Atesto não encontrado para este mês")
+
+    response = requests.get(confirmation["atesto_file_path"])
+    buffer = io.BytesIO(response.content)
+
+    return StreamingResponse(
+        buffer,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f"attachment; filename={confirmation.get('atesto_file_name', 'atesto_coreme.pdf')}"}
+    )
+
+
+@api_router.get("/coreme/report")
+async def export_coreme_report(
+    reference_month: Optional[str] = None,
+    coreme_user: dict = Depends(get_coreme_user)
+):
+    dashboard = await get_coreme_dashboard(reference_month=reference_month, coreme_user=coreme_user)
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Relatório COREME"
+
+    ws.append(["COREME", dashboard["coreme_name"]])
+    ws.append(["Mês de referência", dashboard["reference_month_name"]])
+    ws.append(["Total vinculados", dashboard["total_linked"]])
+    ws.append(["Dentro do prazo", dashboard["delivered_on_time"]])
+    ws.append(["Fora do prazo", dashboard["delivered_late"]])
+    ws.append(["Não entregaram", dashboard["not_delivered"]])
+    ws.append([])
+
+    headers = ["Nome", "E-mail", "Perfil", "Programa", "Ano", "Cenário", "Status", "Data de envio"]
+    ws.append(headers)
+
+    status_label = {
+        "delivered_on_time": "Entregou dentro do prazo",
+        "delivered_late": "Entregou fora do prazo",
+        "not_delivered": "Não entregou",
+    }
+
+    for person in dashboard["people"]:
+        submitted_at = person.get("submitted_at")
+        submitted_text = ""
+        if submitted_at:
+            try:
+                submitted_text = datetime.fromisoformat(submitted_at).strftime("%d/%m/%Y %H:%M:%S")
+            except Exception:
+                submitted_text = submitted_at
+
+        ws.append([
+            person.get("full_name", ""),
+            person.get("email", ""),
+            "Residente" if person.get("role") == "resident" else "Preceptor",
+            person.get("program", ""),
+            person.get("year") or "",
+            person.get("scenario") or "",
+            status_label.get(person.get("status"), person.get("status")),
+            submitted_text,
+        ])
+
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    buffer.seek(0)
+
+    filename = f"relatorio_coreme_{sanitize_filename(dashboard['coreme_name'])}_{dashboard['reference_month']}.xlsx"
+
+    return StreamingResponse(
+        buffer,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename={filename}"}
+    )
+
+
 @api_router.get("/coremes")
 async def public_list_coremes():
     coremes = await db.users.find({
@@ -1277,6 +1541,8 @@ async def startup_db_client():
         await db.users.create_index("id")
         await db.submissions.create_index([("user_id", 1), ("reference_month", 1)])
         await db.submissions.create_index("reference_month")
+        await db.users.create_index("coreme")
+        await db.coreme_confirmations.create_index([("coreme_id", 1), ("reference_month", 1)], unique=True)
 
         print("Banco conectado com sucesso")
 
