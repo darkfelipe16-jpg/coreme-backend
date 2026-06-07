@@ -123,6 +123,7 @@ class UserBase(BaseModel):
     role: str = "resident"
     cpf: Optional[str] = None
     scenario: Optional[str] = None
+    coreme: Optional[str] = None
 
 
 class UserCreate(BaseModel):
@@ -134,6 +135,7 @@ class UserCreate(BaseModel):
     role: str
     cpf: Optional[str] = None
     scenario: Optional[str] = None
+    coreme: Optional[str] = None
 
 
 class UserLogin(BaseModel):
@@ -161,6 +163,7 @@ class UserResponse(BaseModel):
     role: str
     cpf: Optional[str] = None
     scenario: Optional[str] = None
+    coreme: Optional[str] = None
     created_at: datetime
     is_active: bool
 
@@ -567,11 +570,15 @@ async def register(user_data: UserCreate):
     if user_data.role == "resident":
         if not user_data.year:
             raise HTTPException(status_code=400, detail="Year obrigatório para residente")
+        if not user_data.coreme:
+            raise HTTPException(status_code=400, detail="COREME obrigatória para residente")
 
     elif user_data.role == "preceptor":
         # 👇 aqui decide se quer obrigar ou não
         if not user_data.cpf or not user_data.scenario:
             raise HTTPException(status_code=400, detail="CPF e cenário obrigatórios para preceptor")
+        if not user_data.coreme:
+            raise HTTPException(status_code=400, detail="COREME obrigatória para preceptor")
 
     elif user_data.role == "admin":
         pass
@@ -589,6 +596,7 @@ async def register(user_data: UserCreate):
         "role": user_data.role,
         "cpf": user_data.cpf,
         "scenario": user_data.scenario,
+        "coreme": user_data.coreme,
         "created_at": datetime.utcnow(),
         "is_active": True
     }
@@ -608,6 +616,7 @@ async def register(user_data: UserCreate):
             role=user_dict["role"],
             cpf=user_dict.get("cpf"),
             scenario=user_dict.get("scenario"),
+            coreme=user_dict.get("coreme"),
             created_at=user_dict["created_at"],
             is_active=user_dict["is_active"]
         )
@@ -636,6 +645,7 @@ async def login(credentials: UserLogin):
         role=user["role"],
         cpf=user.get("cpf"),
         scenario=user.get("scenario"),
+        coreme=user.get("coreme"),
         created_at=user["created_at"],
         is_active=user["is_active"]
     )
@@ -653,6 +663,7 @@ async def get_me(current_user: dict = Depends(get_current_user)):
     role=current_user.get("role", "resident"),
     cpf=current_user.get("cpf"),
     scenario=current_user.get("scenario"),
+    coreme=current_user.get("coreme"),
     created_at=current_user["created_at"],
     is_active=current_user.get("is_active", True)
 )
@@ -888,6 +899,9 @@ async def get_all_users(admin_user: dict = Depends(get_admin_user)):
             program=u.get("program", ""),
             year=u.get("year", ""),
             role=u["role"],
+            cpf=u.get("cpf"),
+            scenario=u.get("scenario"),
+            coreme=u.get("coreme"),
             created_at=u["created_at"],
             is_active=u.get("is_active", True)
         )
@@ -1216,6 +1230,23 @@ async def list_coremes(admin_user: dict = Depends(get_admin_user)):
             "role": c.get("role", "coreme"),
             "created_at": c.get("created_at"),
             "is_active": c.get("is_active", True),
+        }
+        for c in coremes
+    ]
+
+
+@api_router.get("/coremes")
+async def public_list_coremes():
+    coremes = await db.users.find({
+        "role": "coreme",
+        "is_active": True
+    }).sort("full_name", 1).to_list(10000)
+
+    return [
+        {
+            "id": c["id"],
+            "name": c.get("full_name", ""),
+            "email": c.get("email", ""),
         }
         for c in coremes
     ]
