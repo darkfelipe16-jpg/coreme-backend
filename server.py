@@ -31,6 +31,7 @@ from fastapi import FastAPI, APIRouter, HTTPException, Depends, UploadFile, File
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import FileResponse, StreamingResponse
 from motor.motor_asyncio import AsyncIOMotorClient
+from pymongo.errors import PyMongoError, OperationFailure, ServerSelectionTimeoutError
 from pydantic import BaseModel, Field, EmailStr
 from openpyxl import Workbook
 
@@ -53,7 +54,7 @@ print("CLOUDINARY_URL exists:", bool(os.getenv("CLOUDINARY_URL")))
 print("Cloudinary config:", cloudinary.config().cloud_name)
 
 mongo_url = os.environ["MONGO_URL"]
-client = AsyncIOMotorClient(mongo_url)
+client = AsyncIOMotorClient(mongo_url, serverSelectionTimeoutMS=10000)
 db = client[os.environ.get("DB_NAME", "coreme_uepa")]
 
 JWT_SECRET = os.environ["JWT_SECRET"]
@@ -654,7 +655,11 @@ async def register(user_data: UserCreate):
 
 @api_router.post("/auth/login", response_model=TokenResponse)
 async def login(credentials: UserLogin):
-    user = await db.users.find_one({"email": credentials.email.lower()})
+    try:
+        user = await db.users.find_one({"email": credentials.email.lower()})
+    except PyMongoError as exc:
+        logger.exception("Falha de banco durante autenticacao")
+        raise HTTPException(status_code=503, detail="Banco de dados indisponivel. Verifique a configuracao do MongoDB Atlas.") from exc
     if not user or not verify_password(credentials.password, user["password"]):
         raise HTTPException(status_code=401, detail="Email ou senha inválidos")
 
@@ -2244,7 +2249,7 @@ async def startup_db_client():
         print("Banco conectado com sucesso")
 
     except Exception as e:
-        print("Erro ao conectar no banco:", e)
+        logger.exception("Falha na inicializacao do MongoDB; confira MONGO_URL e usuario Database Access")
 
 
 @app.on_event("shutdown")

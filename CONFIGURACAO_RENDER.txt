@@ -1,0 +1,13 @@
+ResiQ - instrucoes de configuracao
+
+1. Render > coreme-backend-4 > Environment: confira MONGO_URL, DB_NAME e JWT_SECRET.
+2. MongoDB Atlas > Database Access: confirme o usuario de banco (nao o login do site Atlas).
+3. Se a senha do usuario mudou, atualize a MONGO_URL no Render com a nova senha URL-encoded.
+4. Se a senha contiver @, :, /, ?, #, %, use codificacao percent-encoding no componente senha.
+5. Confira o hostname do cluster em Atlas > Connect > Drivers.
+6. Salve e faca novo deploy; teste POST /api/auth/login no /docs com senha incorreta. Esperado: 401.
+7. Se persistir, veja os Logs do Render. A nova versao retorna 503 para falha de banco no login.
+8. Configure BOOTSTRAP_ADMIN_PASSWORD apenas se precisar criar o primeiro admin e ainda nao houver admin no banco.
+9. Cloudinary usa CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET.
+
+AVISO: este pacote nao contem .env nem senhas. Nao substitua credenciais por valores de exemplo.
