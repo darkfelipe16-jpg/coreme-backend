@@ -42,21 +42,21 @@ ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
 
 cloudinary.config(
-    cloud_name="dkfpglash",
-    api_key="489862842735213",
-    api_secret="D8e_IQZMDtRpq3FSpXCjMySIqBA",
+    cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME"),
+    api_key=os.getenv("CLOUDINARY_API_KEY"),
+    api_secret=os.getenv("CLOUDINARY_API_SECRET"),
     secure=True
 )
 
 print("CLOUDINARY_URL exists:", bool(os.getenv("CLOUDINARY_URL")))
-print("CLOUDINARY_URL value:", os.getenv("CLOUDINARY_URL"))
+
 print("Cloudinary config:", cloudinary.config().cloud_name)
 
 mongo_url = os.environ["MONGO_URL"]
 client = AsyncIOMotorClient(mongo_url)
 db = client[os.environ.get("DB_NAME", "coreme_uepa")]
 
-JWT_SECRET = os.environ.get("JWT_SECRET", "uepa_coreme_secret_key_2025")
+JWT_SECRET = os.environ["JWT_SECRET"]
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRATION_HOURS = 24
 
@@ -329,8 +329,8 @@ def decode_token(token: str) -> dict:
 async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)) -> dict:
     payload = decode_token(credentials.credentials)
     user = await db.users.find_one({"id": payload["sub"]})
-    if not user:
-        raise HTTPException(status_code=401, detail="Usuário não encontrado")
+    if not user or not user.get("is_active", True):
+        raise HTTPException(status_code=401, detail="Usuário não encontrado ou inativo")
     return user
 
 
@@ -611,9 +611,6 @@ async def register(user_data: UserCreate):
             raise HTTPException(status_code=400, detail="CPF e cenário obrigatórios para preceptor")
         if not user_data.coreme:
             raise HTTPException(status_code=400, detail="COREME obrigatória para preceptor")
-
-    elif user_data.role == "admin":
-        pass
 
     else:
         raise HTTPException(status_code=400, detail="Role inválido")
@@ -1334,6 +1331,16 @@ async def get_coreme_dashboard(
             "status": status,
         })
 
+    reviews = await db.coreme_reviews.find({
+        "coreme_id": coreme_user["id"], "reference_month": reference_month
+    }).to_list(10000)
+    reviews_by_user = {r["beneficiary_id"]: r for r in reviews}
+    for person in people:
+        review = reviews_by_user.get(person["id"])
+        person["review_decision"] = review.get("decision") if review else None
+        person["review_reason"] = review.get("reason") if review else None
+        person["reviewed_at"] = review["reviewed_at"].isoformat() if review and review.get("reviewed_at") else None
+
     confirmation = await db.coreme_confirmations.find_one({
         "coreme_id": coreme_user["id"],
         "reference_month": reference_month
@@ -1355,12 +1362,72 @@ async def get_coreme_dashboard(
     }
 
 
+class CoremeReviewRequest(BaseModel):
+    reference_month: str = Field(pattern=r"^\d{4}-(0[1-9]|1[0-2])$")
+    beneficiary_id: str
+    decision: str
+    reason: Optional[str] = None
+
+
+@api_router.post("/coreme/reviews")
+async def review_monthly_frequency(
+    payload: CoremeReviewRequest,
+    coreme_user: dict = Depends(get_coreme_user)
+):
+    """Conferência interna da COREME; não equivale à decisão da Comissão."""
+    if await db.commission_batches.find_one({"coreme_id": coreme_user["id"], "reference_month": payload.reference_month}):
+        raise HTTPException(status_code=409, detail="Competência já encaminhada à Comissão; revisão bloqueada")
+    if payload.decision not in ("conforme", "pendente", "nao_conforme"):
+        raise HTTPException(status_code=400, detail="Decisão inválida")
+    reason = (payload.reason or "").strip()
+    if payload.decision != "conforme" and len(reason) < 5:
+        raise HTTPException(status_code=400, detail="Informe o motivo da pendência ou não conformidade")
+    beneficiary = await db.users.find_one({
+        "id": payload.beneficiary_id,
+        "role": {"$in": ["resident", "preceptor"]},
+        "coreme": coreme_user.get("full_name"),
+        "is_active": True
+    })
+    if not beneficiary:
+        raise HTTPException(status_code=404, detail="Beneficiário não vinculado a esta COREME")
+    submission = await db.submissions.find_one({
+        "user_id": payload.beneficiary_id,
+        "reference_month": payload.reference_month
+    })
+    if not submission:
+        raise HTTPException(status_code=400, detail="Não há frequência enviada nesta competência")
+    now = datetime.utcnow()
+    record = {
+        "coreme_id": coreme_user["id"],
+        "beneficiary_id": payload.beneficiary_id,
+        "reference_month": payload.reference_month,
+        "decision": payload.decision,
+        "reason": reason if payload.decision != "conforme" else "",
+        "reviewed_by": coreme_user["id"],
+        "reviewed_at": now,
+        "submission_id": submission.get("id"),
+    }
+    key = {k: record[k] for k in ("coreme_id", "beneficiary_id", "reference_month")}
+    previous = await db.coreme_reviews.find_one(key)
+    await db.coreme_reviews.update_one(key, {"$set": record}, upsert=True)
+    await db.audit_events.insert_one({
+        "id": str(uuid.uuid4()), "action": "coreme_frequency_review",
+        "actor_id": coreme_user["id"], "beneficiary_id": payload.beneficiary_id,
+        "reference_month": payload.reference_month,
+        "previous_decision": previous.get("decision") if previous else None,
+        "decision": payload.decision, "reason": record["reason"], "at": now
+    })
+    return {"ok": True, "decision": payload.decision, "reviewed_at": now.isoformat()}
+
+
 @api_router.post("/coreme/monthly-confirmation")
 async def confirm_coreme_month(
     reference_month: str = Query(...),
     atesto_file: UploadFile = File(...),
     coreme_user: dict = Depends(get_coreme_user)
 ):
+    if await db.commission_batches.find_one({"coreme_id": coreme_user["id"], "reference_month": reference_month}):
+        raise HTTPException(status_code=409, detail="Competência já encaminhada à Comissão")
     if not atesto_file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="O atesto precisa ser enviado em PDF")
 
@@ -1499,6 +1566,628 @@ async def export_coreme_report(
     )
 
 
+# ETAPA 2 — Encaminhamento institucional e análise da Comissão.
+# O envio à Comissão é explícito: uma confirmação/atesto não significa encaminhamento.
+class CommissionAccountCreate(BaseModel):
+    full_name: str
+    email: EmailStr
+    password: str
+
+class CommissionReviewRequest(BaseModel):
+    reference_month: str = Field(pattern=r"^\d{4}-(0[1-9]|1[0-2])$")
+    coreme_id: str
+    beneficiary_id: str
+    decision: str
+    reason: Optional[str] = None
+
+async def get_commission_user(current_user: dict = Depends(get_current_user)) -> dict:
+    if current_user.get("role") not in ("commission", "admin"):
+        raise HTTPException(status_code=403, detail="Acesso restrito à Comissão")
+    return current_user
+
+@api_router.post("/admin/commission-users")
+async def create_commission_user(payload: CommissionAccountCreate, admin: dict = Depends(get_admin_user)):
+    if len(payload.password) < 10:
+        raise HTTPException(status_code=400, detail="Senha deve conter ao menos 10 caracteres")
+    if await db.users.find_one({"email": payload.email.lower()}):
+        raise HTTPException(status_code=409, detail="E-mail já cadastrado")
+    record = {"id": str(uuid.uuid4()), "email": payload.email.lower(),
+              "full_name": payload.full_name.strip(), "program": "Comissão QualificaSaúde",
+              "year": None, "password": hash_password(payload.password),
+              "role": "commission", "is_active": True, "created_at": datetime.utcnow()}
+    await db.users.insert_one(record)
+    return {"id": record["id"], "email": record["email"], "role": "commission"}
+
+@api_router.post("/coreme/forward-to-commission")
+async def forward_to_commission(reference_month: str = Query(..., pattern=r"^\d{4}-(0[1-9]|1[0-2])$"),
+                                coreme_user: dict = Depends(get_coreme_user)):
+    key = {"coreme_id": coreme_user["id"], "reference_month": reference_month}
+    if await db.commission_batches.find_one(key):
+        raise HTTPException(status_code=409, detail="Competência já encaminhada; solicite reabertura administrativa")
+    confirmation = await db.coreme_confirmations.find_one(key)
+    if not confirmation:
+        raise HTTPException(status_code=400, detail="É necessário confirmar a competência e enviar o atesto antes")
+    reviews = await db.coreme_reviews.find({**key, "decision": "conforme"}).to_list(10000)
+    beneficiaries = []
+    for r in reviews:
+        user = await db.users.find_one({"id": r["beneficiary_id"], "coreme": coreme_user.get("full_name"),
+                                        "role": {"$in": ["resident", "preceptor"]}, "is_active": True})
+        submission = await db.submissions.find_one({"user_id": r["beneficiary_id"],
+                                                     "reference_month": reference_month})
+        if user and submission and submission.get("id") == r.get("submission_id"):
+            beneficiaries.append({"beneficiary_id": user["id"], "beneficiary_name": user.get("full_name"),
+                                  "role": user.get("role"), "program": user.get("program"),
+                                  "submission_id": submission["id"]})
+    if not beneficiaries:
+        raise HTTPException(status_code=400, detail="Nenhuma frequência conforme para encaminhamento")
+    now = datetime.utcnow()
+    batch = {**key, "id": str(uuid.uuid4()), "coreme_name": coreme_user.get("full_name"),
+             "beneficiaries": beneficiaries, "atesto_file_path": confirmation.get("atesto_file_path"),
+             "forwarded_at": now, "forwarded_by": coreme_user["id"], "status": "em_analise"}
+    await db.commission_batches.insert_one(batch)
+    await db.audit_events.insert_one({"id": str(uuid.uuid4()), "action": "forward_to_commission",
+                                       "actor_id": coreme_user["id"], "reference_month": reference_month,
+                                       "batch_id": batch["id"], "count": len(beneficiaries), "at": now})
+    return {"ok": True, "batch_id": batch["id"], "forwarded_count": len(beneficiaries)}
+
+@api_router.get("/commission/dashboard")
+async def commission_dashboard(reference_month: str = Query(..., pattern=r"^\d{4}-(0[1-9]|1[0-2])$"),
+                               actor: dict = Depends(get_commission_user)):
+    batches = await db.commission_batches.find({"reference_month": reference_month}).to_list(10000)
+    reviews = await db.commission_reviews.find({"reference_month": reference_month}).to_list(20000)
+    review_map = {(r["coreme_id"], r["beneficiary_id"]): r for r in reviews}
+    output = []
+    for batch in batches:
+        people = []
+        for person in batch["beneficiaries"]:
+            r = review_map.get((batch["coreme_id"], person["beneficiary_id"]))
+            people.append({**person, "decision": r.get("decision") if r else None,
+                           "reason": r.get("reason") if r else None,
+                           "reviewed_at": r["reviewed_at"].isoformat() if r else None})
+        output.append({"id": batch["id"], "coreme_id": batch["coreme_id"],
+                       "coreme_name": batch["coreme_name"], "status": batch.get("status"),
+                       "forwarded_at": batch["forwarded_at"].isoformat(),
+                       "atesto_file_path": batch.get("atesto_file_path"), "beneficiaries": people})
+    return {"reference_month": reference_month, "batches": output,
+            "total_forwarded": sum(len(b["beneficiaries"]) for b in output),
+            "total_reviewed": sum(1 for b in output for x in b["beneficiaries"] if x["decision"]),
+            "total_conforme": sum(1 for b in output for x in b["beneficiaries"] if x["decision"] == "conforme")}
+
+@api_router.post("/commission/reviews")
+async def commission_review(payload: CommissionReviewRequest,
+                            actor: dict = Depends(get_commission_user)):
+    if payload.decision not in ("conforme", "nao_conforme"):
+        raise HTTPException(status_code=400, detail="Decisão inválida")
+    reason = (payload.reason or "").strip()
+    if payload.decision == "nao_conforme" and len(reason) < 5:
+        raise HTTPException(status_code=400, detail="Justificativa obrigatória para não conformidade")
+    batch = await db.commission_batches.find_one({"coreme_id": payload.coreme_id,
+                                                   "reference_month": payload.reference_month})
+    if not batch or not any(p["beneficiary_id"] == payload.beneficiary_id for p in batch["beneficiaries"]):
+        raise HTTPException(status_code=404, detail="Frequência não encaminhada à Comissão")
+    if batch.get("status") != "em_analise":
+        raise HTTPException(status_code=409, detail="Lote encerrado para análise")
+    if await db.payment_lists.find_one({"reference_month": payload.reference_month}):
+        raise HTTPException(status_code=409, detail="Relação de pagamento consolidada; análise bloqueada")
+    key = {"coreme_id": payload.coreme_id, "reference_month": payload.reference_month,
+           "beneficiary_id": payload.beneficiary_id}
+    old = await db.commission_reviews.find_one(key)
+    now = datetime.utcnow()
+    await db.commission_reviews.update_one(key, {"$set": {**key, "decision": payload.decision,
+        "reason": reason if payload.decision == "nao_conforme" else "",
+        "reviewed_by": actor["id"], "reviewed_at": now}}, upsert=True)
+    await db.audit_events.insert_one({"id": str(uuid.uuid4()), "action": "commission_review",
+        "actor_id": actor["id"], "beneficiary_id": payload.beneficiary_id,
+        "coreme_id": payload.coreme_id, "reference_month": payload.reference_month,
+        "previous_decision": old.get("decision") if old else None,
+        "decision": payload.decision, "reason": reason, "at": now})
+    return {"ok": True, "decision": payload.decision}
+
+# ETAPA 3 — Consolidação e encaminhamento à SESPA/SAGA.
+# O sistema gera relação administrativa; não executa transferência bancária.
+class SespaAccountCreate(BaseModel):
+    email: EmailStr
+    full_name: str
+    password: str
+
+
+async def get_finance_user(current_user: dict = Depends(get_current_user)) -> dict:
+    if current_user.get("role") not in ("sespa", "commission", "admin"):
+        raise HTTPException(status_code=403, detail="Acesso restrito à Comissão e SESPA/SAGA")
+    return current_user
+
+
+@api_router.post("/admin/sespa-users")
+async def create_sespa_user(payload: SespaAccountCreate, admin: dict = Depends(get_admin_user)):
+    if len(payload.password) < 10:
+        raise HTTPException(status_code=400, detail="Senha deve conter ao menos 10 caracteres")
+    if await db.users.find_one({"email": payload.email.lower()}):
+        raise HTTPException(status_code=409, detail="E-mail já cadastrado")
+    record = {"id": str(uuid.uuid4()), "email": payload.email.lower(),
+              "full_name": payload.full_name.strip(), "program": "SESPA/SAGA", "year": None,
+              "password": hash_password(payload.password), "role": "sespa",
+              "is_active": True, "created_at": datetime.utcnow()}
+    await db.users.insert_one(record)
+    return {"id": record["id"], "email": record["email"], "role": "sespa"}
+
+
+def payment_snapshot_public(doc: dict) -> dict:
+    return {"id": doc["id"], "reference_month": doc["reference_month"],
+            "status": doc["status"], "generated_at": doc["generated_at"].isoformat(),
+            "generated_by": doc["generated_by"], "forwarded_at": doc.get("forwarded_at").isoformat() if doc.get("forwarded_at") else None,
+            "forwarded_by": doc.get("forwarded_by"), "total": len(doc["beneficiaries"]),
+            "beneficiaries": doc["beneficiaries"]}
+
+
+async def build_payment_candidates(reference_month: str) -> tuple[list, list]:
+    batches = await db.commission_batches.find({"reference_month": reference_month}).to_list(10000)
+    candidates = []
+    missing = []
+    seen = set()
+    for batch in batches:
+        for person in batch["beneficiaries"]:
+            key = {"coreme_id": batch["coreme_id"], "reference_month": reference_month,
+                   "beneficiary_id": person["beneficiary_id"]}
+            review = await db.commission_reviews.find_one(key)
+            if not review:
+                missing.append({"coreme": batch.get("coreme_name"), "beneficiary": person.get("beneficiary_name")})
+                continue
+            if review["decision"] != "conforme":
+                continue
+            if person["beneficiary_id"] in seen:
+                raise HTTPException(status_code=409, detail="Beneficiário consta em mais de um lote; corrigir duplicidade antes de consolidar")
+            seen.add(person["beneficiary_id"])
+            candidates.append({"beneficiary_id": person["beneficiary_id"],
+                               "beneficiary_name": person.get("beneficiary_name"),
+                               "role": person.get("role"), "program": person.get("program"),
+                               "coreme_id": batch["coreme_id"], "coreme_name": batch.get("coreme_name"),
+                               "submission_id": person.get("submission_id")})
+    candidates.sort(key=lambda x: (x["coreme_name"] or "", x["beneficiary_name"] or ""))
+    return candidates, missing
+
+
+
+# ETAPA 4 — Ocorrências e declarações de elegibilidade (execução, sem seleção por edital)
+OCCURRENCE_TYPES = {"ferias", "afastamento", "suspensao", "desligamento", "beneficio_incompativel", "pagamento_indevido", "outros"}
+OCCURRENCE_STATES = {"registrada", "em_analise", "confirmada", "descartada"}
+
+class OccurrenceCreate(BaseModel):
+    beneficiary_id: str
+    reference_month: str = Field(pattern=r"^\d{4}-(0[1-9]|1[0-2])$")
+    occurrence_type: str
+    description: str = Field(min_length=8, max_length=2000)
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
+
+class OccurrenceDecision(BaseModel):
+    status: str
+    reason: str = Field(min_length=8, max_length=2000)
+
+class BenefitDeclaration(BaseModel):
+    reference_month: str = Field(pattern=r"^\d{4}-(0[1-9]|1[0-2])$")
+    declares_no_incompatible_benefits: bool
+
+
+def occurrence_public(item: dict) -> dict:
+    return {k: (v.isoformat() if isinstance(v, datetime) else v) for k, v in item.items() if k != "_id"}
+
+async def occurrence_access(actor: dict, beneficiary: dict) -> bool:
+    role = actor.get("role")
+    if role in {"admin", "commission", "sespa"}:
+        return True
+    if role == "coreme":
+        return beneficiary.get("coreme") in {actor.get("full_name"), actor.get("name"), actor.get("coreme")}
+    return actor.get("id") == beneficiary.get("id")
+
+@api_router.get("/occurrences")
+async def list_occurrences(reference_month: Optional[str] = None, beneficiary_id: Optional[str] = None,
+                           actor: dict = Depends(get_current_user)):
+    query = {}
+    if reference_month:
+        if not __import__('re').fullmatch(r"\d{4}-(0[1-9]|1[0-2])", reference_month):
+            raise HTTPException(status_code=422, detail="Competência inválida")
+        query["reference_month"] = reference_month
+    if beneficiary_id:
+        query["beneficiary_id"] = beneficiary_id
+    if actor["role"] in {"resident", "preceptor"}:
+        query["beneficiary_id"] = actor["id"]
+    items = await db.occurrences.find(query).sort("created_at", -1).to_list(1000)
+    if actor["role"] == "coreme":
+        items = [i for i in items if await occurrence_access(actor, await db.users.find_one({"id": i["beneficiary_id"]}) or {})]
+    return [occurrence_public(i) for i in items]
+
+@api_router.post("/occurrences")
+async def create_occurrence(payload: OccurrenceCreate, actor: dict = Depends(get_current_user)):
+    beneficiary = await db.users.find_one({"id": payload.beneficiary_id})
+    if not beneficiary or beneficiary.get("role") not in {"resident", "preceptor"}:
+        raise HTTPException(status_code=404, detail="Beneficiário não encontrado")
+    if not await occurrence_access(actor, beneficiary):
+        raise HTTPException(status_code=403, detail="Sem acesso ao beneficiário")
+    if actor["role"] == "sespa":
+        raise HTTPException(status_code=403, detail="Perfil SESPA apenas consulta ocorrências")
+    if payload.occurrence_type not in OCCURRENCE_TYPES:
+        raise HTTPException(status_code=422, detail="Tipo de ocorrência inválido")
+    if await db.payment_lists.find_one({"reference_month": payload.reference_month}):
+        raise HTTPException(status_code=409, detail="Relação já consolidada; ocorrência exige procedimento administrativo separado")
+    now = datetime.utcnow()
+    doc = {"id": str(uuid.uuid4()), **payload.model_dump(), "beneficiary_name": beneficiary.get("full_name"),
+           "coreme": beneficiary.get("coreme"), "status": "registrada", "created_at": now,
+           "created_by": actor["id"], "decided_at": None, "decided_by": None, "decision_reason": None}
+    await db.occurrences.insert_one(doc)
+    await db.audit_events.insert_one({"id": str(uuid.uuid4()), "action": "occurrence_created", "actor_id": actor["id"],
+        "occurrence_id": doc["id"], "reference_month": payload.reference_month, "created_at": now})
+    return occurrence_public(doc)
+
+@api_router.post("/occurrences/{occurrence_id}/decision")
+async def decide_occurrence(occurrence_id: str, payload: OccurrenceDecision, actor: dict = Depends(get_current_user)):
+    if actor.get("role") not in {"commission", "admin"}:
+        raise HTTPException(status_code=403, detail="Decisão restrita à Comissão")
+    if payload.status not in {"confirmada", "descartada", "em_analise"}:
+        raise HTTPException(status_code=422, detail="Situação inválida")
+    doc = await db.occurrences.find_one({"id": occurrence_id})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Ocorrência não encontrada")
+    if await db.payment_lists.find_one({"reference_month": doc["reference_month"]}):
+        raise HTTPException(status_code=409, detail="Relação consolidada; decisão bloqueada")
+    now = datetime.utcnow()
+    await db.occurrences.update_one({"id": occurrence_id}, {"$set": {"status": payload.status,
+        "decision_reason": payload.reason, "decided_at": now, "decided_by": actor["id"]}})
+    await db.audit_events.insert_one({"id": str(uuid.uuid4()), "action": "occurrence_decided", "actor_id": actor["id"],
+        "occurrence_id": occurrence_id, "status": payload.status, "created_at": now})
+    return {"ok": True, "status": payload.status}
+
+@api_router.post("/benefits/declaration")
+async def save_benefit_declaration(payload: BenefitDeclaration, actor: dict = Depends(get_current_user)):
+    if actor.get("role") not in {"resident", "preceptor"}:
+        raise HTTPException(status_code=403, detail="Declaração exclusiva do beneficiário")
+    if await db.payment_lists.find_one({"reference_month": payload.reference_month}):
+        raise HTTPException(status_code=409, detail="Competência já consolidada")
+    now = datetime.utcnow()
+    await db.benefit_declarations.update_one({"beneficiary_id": actor["id"], "reference_month": payload.reference_month},
+        {"$set": {"declares_no_incompatible_benefits": payload.declares_no_incompatible_benefits,
+        "updated_at": now, "actor_id": actor["id"]}}, upsert=True)
+    await db.audit_events.insert_one({"id": str(uuid.uuid4()), "action": "benefit_declaration", "actor_id": actor["id"],
+        "reference_month": payload.reference_month, "created_at": now})
+    return {"ok": True, "reference_month": payload.reference_month}
+
+@api_router.get("/benefits/declaration")
+async def get_benefit_declaration(reference_month: str, actor: dict = Depends(get_current_user)):
+    if actor.get("role") not in {"resident", "preceptor"}:
+        raise HTTPException(status_code=403, detail="Consulta exclusiva do beneficiário")
+    doc = await db.benefit_declarations.find_one({"beneficiary_id": actor["id"], "reference_month": reference_month})
+    return {"reference_month": reference_month, "declares_no_incompatible_benefits":
+            doc.get("declares_no_incompatible_benefits") if doc else None}
+
+@api_router.get("/commission/payment-preview")
+async def payment_preview(reference_month: str = Query(..., pattern=r"^\d{4}-(0[1-9]|1[0-2])$"),
+                          actor: dict = Depends(get_commission_user)):
+    candidates, missing = await build_payment_candidates(reference_month)
+    existing = await db.payment_lists.find_one({"reference_month": reference_month})
+    return {"reference_month": reference_month, "total_eligible": len(candidates),
+            "pending_reviews": missing, "beneficiaries": candidates,
+            "existing_list": payment_snapshot_public(existing) if existing else None}
+
+
+@api_router.post("/commission/payment-lists")
+async def create_payment_list(reference_month: str = Query(..., pattern=r"^\d{4}-(0[1-9]|1[0-2])$"),
+                              actor: dict = Depends(get_commission_user)):
+    if await db.payment_lists.find_one({"reference_month": reference_month}):
+        raise HTTPException(status_code=409, detail="Já existe relação consolidada nesta competência")
+    candidates, missing = await build_payment_candidates(reference_month)
+    blockers = await db.occurrences.find({"reference_month": reference_month,
+        "status": {"$in": ["registrada", "em_analise", "confirmada"]},
+        "occurrence_type": {"$in": ["suspensao", "desligamento", "beneficio_incompativel", "pagamento_indevido"]}}).to_list(10000)
+    affected = {o["beneficiary_id"] for o in blockers}
+    if any(p["beneficiary_id"] in affected for p in candidates):
+        raise HTTPException(status_code=409, detail="Há ocorrências impeditivas ou pendentes de análise; revise antes de consolidar")
+    declarations = await db.benefit_declarations.find({"reference_month": reference_month,
+        "declares_no_incompatible_benefits": False}).to_list(10000)
+    if any(p["beneficiary_id"] in {d["beneficiary_id"] for d in declarations} for p in candidates):
+        raise HTTPException(status_code=409, detail="Beneficiário declarou benefício potencialmente incompatível; análise necessária")
+    if missing:
+        raise HTTPException(status_code=409, detail=f"Existem {len(missing)} frequência(s) sem decisão da Comissão")
+    if not candidates:
+        raise HTTPException(status_code=400, detail="Nenhum beneficiário conforme para consolidar")
+    now = datetime.utcnow()
+    doc = {"id": str(uuid.uuid4()), "reference_month": reference_month,
+           "beneficiaries": candidates, "generated_at": now, "generated_by": actor["id"],
+           "status": "rascunho", "forwarded_at": None, "forwarded_by": None}
+    try:
+        await db.payment_lists.insert_one(doc)
+    except Exception as e:
+        if "duplicate" in str(e).lower() or "E11000" in str(e):
+            raise HTTPException(status_code=409, detail="Relação já criada por outro usuário")
+        raise
+    await db.audit_events.insert_one({"id": str(uuid.uuid4()), "action": "payment_list_generated",
+        "actor_id": actor["id"], "reference_month": reference_month,
+        "count": len(candidates), "at": now})
+    return payment_snapshot_public(doc)
+
+
+@api_router.post("/commission/payment-lists/{reference_month}/forward")
+async def forward_payment_list(reference_month: str, actor: dict = Depends(get_commission_user)):
+    if not __import__('re').fullmatch(r"\d{4}-(0[1-9]|1[0-2])", reference_month):
+        raise HTTPException(status_code=422, detail="Competência inválida")
+    now = datetime.utcnow()
+    result = await db.payment_lists.update_one({"reference_month": reference_month, "status": "rascunho"},
+        {"$set": {"status": "encaminhada_sespa", "forwarded_at": now, "forwarded_by": actor["id"]}})
+    if result.modified_count != 1:
+        raise HTTPException(status_code=409, detail="Relação inexistente ou já encaminhada")
+    await db.audit_events.insert_one({"id": str(uuid.uuid4()), "action": "payment_list_forwarded",
+        "actor_id": actor["id"], "reference_month": reference_month, "at": now})
+    return {"ok": True, "status": "encaminhada_sespa", "forwarded_at": now.isoformat(),
+            "note": "Registro de encaminhamento no sistema; não substitui protocolo externo obrigatório"}
+
+
+@api_router.get("/payments/lists")
+async def list_payment_lists(reference_month: Optional[str] = None,
+                             actor: dict = Depends(get_finance_user)):
+    if reference_month and not __import__('re').fullmatch(r"\d{4}-(0[1-9]|1[0-2])", reference_month):
+        raise HTTPException(status_code=422, detail="Competência inválida")
+    query = {"reference_month": reference_month} if reference_month else {}
+    if actor["role"] == "sespa":
+        query["status"] = "encaminhada_sespa"
+    docs = await db.payment_lists.find(query).sort("reference_month", -1).to_list(500)
+    return [payment_snapshot_public(d) for d in docs]
+
+
+@api_router.get("/payments/lists/{reference_month}/xlsx")
+async def export_payment_list(reference_month: str, actor: dict = Depends(get_finance_user)):
+    if not __import__('re').fullmatch(r"\d{4}-(0[1-9]|1[0-2])", reference_month):
+        raise HTTPException(status_code=422, detail="Competência inválida")
+    doc = await db.payment_lists.find_one({"reference_month": reference_month})
+    if not doc or (actor["role"] == "sespa" and doc["status"] != "encaminhada_sespa"):
+        raise HTTPException(status_code=404, detail="Relação não disponível")
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Beneficiários aptos"
+    ws.append(["Competência", "Nome", "Tipo", "Programa", "COREME/COREMU", "ID beneficiário"])
+    for person in doc["beneficiaries"]:
+        ws.append([reference_month, person.get("beneficiary_name"),
+                   "Residente" if person.get("role") == "resident" else "Preceptor",
+                   person.get("program"), person.get("coreme_name"), person.get("beneficiary_id")])
+    for col, width in {"A": 15, "B": 40, "C": 16, "D": 36, "E": 32, "F": 42}.items():
+        ws.column_dimensions[col].width = width
+    output = io.BytesIO()
+    wb.save(output)
+    output.seek(0)
+    return StreamingResponse(output, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="qualificasaude_aptos_{reference_month}.xlsx"'})
+
+
+
+# ETAPA 5 — Indicadores e relatórios de execução (somente usuários institucionais).
+def _validate_competence(value: str) -> str:
+    import re
+    if not re.fullmatch(r"\\d{4}-(0[1-9]|1[0-2])", value):
+        raise HTTPException(status_code=422, detail="Competência inválida; use AAAA-MM")
+    return value
+
+def _execution_scope(actor: dict) -> dict:
+    if actor.get("role") not in {"coreme", "commission", "sespa", "admin"}:
+        raise HTTPException(status_code=403, detail="Acesso restrito a perfis institucionais")
+    return {"coreme": actor.get("full_name")} if actor.get("role") == "coreme" else {}
+
+@api_router.get("/reports/overview")
+async def execution_overview(
+    reference_month: str = Query(...),
+    actor: dict = Depends(get_current_user)
+):
+    _validate_competence(reference_month)
+    scope = _execution_scope(actor)
+    users = await db.users.find({"role": {"$in": ["resident", "preceptor"]}, "is_active": True, **scope},
+                                {"_id": 0, "id": 1, "full_name": 1, "program": 1, "role": 1, "coreme": 1}).to_list(15000)
+    ids = [u["id"] for u in users]
+    submissions = await db.submissions.find({"reference_month": reference_month, "user_id": {"$in": ids}},
+                                             {"_id": 0, "user_id": 1, "submitted_at": 1}).to_list(30000)
+    submitted_ids = {s["user_id"] for s in submissions}
+    review_query = {"reference_month": reference_month, "beneficiary_id": {"$in": ids}}
+    coreme_reviews = await db.coreme_reviews.find(review_query, {"_id": 0, "beneficiary_id": 1, "decision": 1}).to_list(30000)
+    commission_reviews = await db.commission_reviews.find(review_query, {"_id": 0, "beneficiary_id": 1, "decision": 1}).to_list(30000)
+    batches_query = {"reference_month": reference_month}
+    if actor.get("role") == "coreme":
+        batches_query["coreme_id"] = actor["id"]
+    batches = await db.commission_batches.find(batches_query, {"_id": 0, "beneficiaries": 1, "coreme_name": 1}).to_list(5000)
+    forwarded_ids = {p["beneficiary_id"] for b in batches for p in b.get("beneficiaries", []) if p["beneficiary_id"] in ids}
+    occurrences = await db.occurrences.find(review_query, {"_id": 0, "status": 1}).to_list(30000)
+    payment = await db.payment_lists.find_one({"reference_month": reference_month}, {"_id": 0, "status": 1, "beneficiaries": 1})
+    paid_ids = {p["beneficiary_id"] for p in payment.get("beneficiaries", [])} if payment else set()
+    by_institution = {}
+    by_program = {}
+    for u in users:
+        institution = u.get("coreme") or "Não informada"
+        program = u.get("program") or "Não informado"
+        for bucket, key in ((by_institution, institution), (by_program, program)):
+            record = bucket.setdefault(key, {"total": 0, "enviadas": 0, "pendentes": 0})
+            record["total"] += 1
+            record["enviadas"] += int(u["id"] in submitted_ids)
+            record["pendentes"] += int(u["id"] not in submitted_ids)
+    def rows(bucket, key):
+        return [{key: k, **v} for k, v in sorted(bucket.items())]
+    return {
+        "reference_month": reference_month,
+        "total_beneficiaries": len(users),
+        "submitted": len(submitted_ids),
+        "not_submitted": len(users) - len(submitted_ids),
+        "coreme_reviewed": len({r["beneficiary_id"] for r in coreme_reviews}),
+        "coreme_conforme": len({r["beneficiary_id"] for r in coreme_reviews if r.get("decision") == "conforme"}),
+        "forwarded_to_commission": len(forwarded_ids),
+        "commission_reviewed": len({r["beneficiary_id"] for r in commission_reviews}),
+        "commission_conforme": len({r["beneficiary_id"] for r in commission_reviews if r.get("decision") == "conforme"}),
+        "occurrences_open": sum(1 for o in occurrences if o.get("status") in ("registrada", "em_analise")),
+        "payment_list_status": payment.get("status") if payment else None,
+        "payment_list_count": len(paid_ids & set(ids)),
+        "by_institution": rows(by_institution, "institution"),
+        "by_program": rows(by_program, "program"),
+        "alerts": _execution_alerts(reference_month, len(users) - len(submitted_ids),
+                                    len(forwarded_ids), len({r["beneficiary_id"] for r in commission_reviews}),
+                                    payment, actor),
+    }
+
+def _execution_alerts(reference_month, missing, forwarded, reviewed, payment, actor):
+    # Prazos legais se referem ao mês seguinte à competência.
+    from datetime import date
+    y, m = map(int, reference_month.split("-"))
+    next_y, next_m = (y + 1, 1) if m == 12 else (y, m + 1)
+    today = date.today()
+    day5, day15 = date(next_y, next_m, 5), date(next_y, next_m, 15)
+    alerts = []
+    if missing:
+        alerts.append({"level": "warning", "message": f"{missing} beneficiário(s) sem envio registrado na competência."})
+    if actor.get("role") in ("coreme", "admin", "commission") and today <= day5:
+        alerts.append({"level": "info", "message": f"Prazo de encaminhamento COREME/COREMU: {day5:%d/%m/%Y} (via UEPA)."})
+    if actor.get("role") in ("commission", "admin"):
+        if forwarded > reviewed:
+            alerts.append({"level": "warning", "message": f"{forwarded-reviewed} frequência(s) encaminhada(s) ainda sem análise da Comissão."})
+        if not payment and today <= day15:
+            alerts.append({"level": "info", "message": f"Prazo de envio da relação à SESPA/SAGA: {day15:%d/%m/%Y}."})
+    if payment and payment.get("status") == "rascunho":
+        alerts.append({"level": "warning", "message": "Relação de pagamento gerada, mas ainda não encaminhada."})
+    return alerts
+
+@api_router.get("/reports/overview/xlsx")
+async def export_execution_overview(
+    reference_month: str = Query(...),
+    actor: dict = Depends(get_current_user)
+):
+    result = await execution_overview(reference_month, actor)
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Resumo"
+    ws.append(["Indicador", "Valor"])
+    for label, key in [("Competência", "reference_month"), ("Beneficiários ativos", "total_beneficiaries"),
+                       ("Frequências enviadas", "submitted"), ("Sem frequência", "not_submitted"),
+                       ("Conferidas COREME", "coreme_reviewed"), ("Conformes COREME", "coreme_conforme"),
+                       ("Encaminhadas à Comissão", "forwarded_to_commission"),
+                       ("Analisadas Comissão", "commission_reviewed"), ("Conformes Comissão", "commission_conforme"),
+                       ("Ocorrências em aberto", "occurrences_open"), ("Na relação de pagamento", "payment_list_count"),
+                       ("Situação da relação", "payment_list_status")]:
+        ws.append([label, result.get(key)])
+    for sheet_name, field, label in [("Instituições", "by_institution", "institution"), ("Programas", "by_program", "program")]:
+        sheet = wb.create_sheet(sheet_name)
+        sheet.append([label.title(), "Total", "Enviadas", "Pendentes"])
+        for row in result[field]:
+            sheet.append([row[label], row["total"], row["enviadas"], row["pendentes"]])
+        sheet.column_dimensions["A"].width = 45
+    ws.column_dimensions["A"].width = 38
+    ws.column_dimensions["B"].width = 24
+    output = io.BytesIO()
+    wb.save(output)
+    output.seek(0)
+    return StreamingResponse(output, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="qualificasaude_relatorio_{reference_month}.xlsx"'})
+
+
+# ETAPA 6: Administração de usuários e consulta de auditoria.
+# A administração de privilégios permanece exclusiva do administrador.
+from fastapi import Request
+
+ALLOWED_INSTITUTIONAL_ROLES = {"coreme", "commission", "sespa", "admin"}
+MANAGED_ROLES = {"resident", "preceptor", "coreme", "commission", "sespa"}
+
+class UserAdministrationUpdate(BaseModel):
+    is_active: Optional[bool] = None
+    coreme: Optional[str] = None
+
+class InstitutionalAccountCreate(BaseModel):
+    full_name: str
+    email: EmailStr
+    password: str
+    role: str
+    coreme: Optional[str] = None
+
+async def append_security_audit(actor: dict, action: str, target_id: str,
+                                previous: dict, changes: dict, request: Request):
+    await db.audit_events.insert_one({
+        "id": str(uuid.uuid4()), "action": action, "actor_id": actor["id"],
+        "actor_role": actor.get("role"), "target_id": target_id,
+        "previous": previous, "changes": changes, "at": datetime.utcnow(),
+        "ip": request.client.host if request.client else None,
+    })
+
+@api_router.get("/security/users")
+async def list_managed_users(
+    role: Optional[str] = Query(None),
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    actor: dict = Depends(get_admin_user)
+):
+    if role and role not in MANAGED_ROLES | {"admin"}:
+        raise HTTPException(status_code=422, detail="Perfil inválido")
+    query = {"role": role} if role else {}
+    cursor = db.users.find(query, {"_id": 0, "password": 0, "cpf": 0}).sort("full_name", 1).skip(offset).limit(limit)
+    return {"items": await cursor.to_list(limit), "total": await db.users.count_documents(query)}
+
+@api_router.post("/security/users", status_code=201)
+async def create_institutional_account(
+    payload: InstitutionalAccountCreate,
+    request: Request,
+    actor: dict = Depends(get_admin_user)
+):
+    if payload.role not in {"coreme", "commission", "sespa"}:
+        raise HTTPException(status_code=422, detail="Perfil institucional não permitido")
+    name = payload.full_name.strip()
+    if len(name) < 3 or len(payload.password) < 10:
+        raise HTTPException(status_code=422, detail="Nome ou senha inválidos (mínimo 10 caracteres)")
+    if payload.role == "coreme" and not payload.coreme:
+        raise HTTPException(status_code=422, detail="Instituição COREME/COREMU obrigatória")
+    email = str(payload.email).lower()
+    if await db.users.find_one({"email": email}):
+        raise HTTPException(status_code=409, detail="E-mail já cadastrado")
+    doc = {"id": str(uuid.uuid4()), "email": email, "full_name": name,
+           "password": hash_password(payload.password), "role": payload.role,
+           "coreme": payload.coreme.strip() if payload.coreme else None,
+           "program": "Administração institucional", "year": None,
+           "is_active": True, "created_at": datetime.utcnow()}
+    await db.users.insert_one(doc)
+    await append_security_audit(actor, "institutional_user_created", doc["id"], {},
+                                {"role": doc["role"], "coreme": doc["coreme"]}, request)
+    return {"id": doc["id"], "email": email, "role": doc["role"]}
+
+@api_router.patch("/security/users/{user_id}")
+async def update_managed_user(
+    user_id: str,
+    payload: UserAdministrationUpdate,
+    request: Request,
+    actor: dict = Depends(get_admin_user)
+):
+    target = await db.users.find_one({"id": user_id})
+    if not target:
+        raise HTTPException(status_code=404, detail="Usuário não encontrado")
+    changes = payload.model_dump(exclude_unset=True)
+    if not changes:
+        raise HTTPException(status_code=422, detail="Nenhuma alteração informada")
+    if target["id"] == actor["id"] and changes.get("is_active") is False:
+        raise HTTPException(status_code=409, detail="Não é permitido desativar a própria conta")
+    if "coreme" in changes:
+        if target.get("role") not in {"resident", "preceptor", "coreme"}:
+            raise HTTPException(status_code=422, detail="Vínculo institucional não aplicável a este perfil")
+        if not isinstance(changes["coreme"], str) or not changes["coreme"].strip():
+            raise HTTPException(status_code=422, detail="Instituição não pode ficar vazia")
+        changes["coreme"] = changes["coreme"].strip()
+    before = {k: target.get(k) for k in changes}
+    await db.users.update_one({"id": user_id}, {"$set": changes})
+    await append_security_audit(actor, "user_updated", user_id, before, changes, request)
+    return {"ok": True, "id": user_id, "changes": changes}
+
+@api_router.get("/security/audit")
+async def list_security_audit(
+    action: Optional[str] = Query(None, max_length=100),
+    limit: int = Query(100, ge=1, le=300),
+    offset: int = Query(0, ge=0),
+    actor: dict = Depends(get_admin_user)
+):
+    query = {"action": action} if action else {}
+    # Excluir campos sensíveis eventualmente registrados por versões antigas.
+    projection = {"_id": 0, "password": 0, "cpf": 0, "token": 0, "access_token": 0}
+    cursor = db.audit_events.find(query, projection).sort("at", -1).skip(offset).limit(limit)
+    entries = await cursor.to_list(limit)
+    # Limitar saída aos metadados essenciais; evitar divulgação de justificativas clínicas.
+    keys = {"id", "action", "actor_id", "actor_role", "target_id", "beneficiary_id",
+            "reference_month", "at", "ip", "decision", "previous_decision"}
+    return {"items": [{k: v for k, v in entry.items() if k in keys} for entry in entries],
+            "total": await db.audit_events.count_documents(query)}
+
 @api_router.get("/coremes")
 async def public_list_coremes():
     coremes = await db.users.find({
@@ -1522,27 +2211,35 @@ async def startup_db_client():
     try:
         admin = await db.users.find_one({"email": "admin@uepa.br"})
 
-        if not admin:
+        bootstrap_password = os.getenv("BOOTSTRAP_ADMIN_PASSWORD", "").strip()
+        if not admin and bootstrap_password:
             admin_user = {
                 "id": str(uuid.uuid4()),
                 "email": "admin@uepa.br",
                 "full_name": "Administrador COREME",
                 "program": "Administração",
                 "year": "N/A",
-                "password": hash_password("admin123"),
+                "password": hash_password(bootstrap_password),
                 "role": "admin",
                 "created_at": datetime.utcnow(),
                 "is_active": True
             }
             await db.users.insert_one(admin_user)
-            logger.info("Default admin user created: admin@uepa.br / admin123")
+            logger.info("Administrador inicial criado; altere a senha após o primeiro acesso")
 
         await db.users.create_index("email", unique=True)
         await db.users.create_index("id")
         await db.submissions.create_index([("user_id", 1), ("reference_month", 1)])
         await db.submissions.create_index("reference_month")
         await db.users.create_index("coreme")
+        await db.audit_events.create_index([("at", -1)])
         await db.coreme_confirmations.create_index([("coreme_id", 1), ("reference_month", 1)], unique=True)
+        await db.coreme_reviews.create_index([("coreme_id", 1), ("beneficiary_id", 1), ("reference_month", 1)], unique=True)
+        await db.commission_batches.create_index([("coreme_id", 1), ("reference_month", 1)], unique=True)
+        await db.commission_reviews.create_index([("coreme_id", 1), ("beneficiary_id", 1), ("reference_month", 1)], unique=True)
+        await db.payment_lists.create_index("reference_month", unique=True)
+        await db.occurrences.create_index([("reference_month", 1), ("beneficiary_id", 1)])
+        await db.benefit_declarations.create_index([("reference_month", 1), ("beneficiary_id", 1)], unique=True)
 
         print("Banco conectado com sucesso")
 
