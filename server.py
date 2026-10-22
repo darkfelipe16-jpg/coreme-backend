@@ -2209,6 +2209,71 @@ async def public_list_coremes():
         for c in coremes
     ]
 
+"""Rota experimental do ResiQ: comparação facial sem persistência.
+Inserir este conteúdo em servidor.py antes de app.include_router(api_router).
+Não utilizar como validação definitiva de identidade.
+"""
+from fastapi import UploadFile, File, Depends, HTTPException
+from starlette.concurrency import run_in_threadpool
+
+FACE_MAX_BYTES = 5 * 1024 * 1024
+
+
+def _verify_face_images(document_image: bytes, selfie_image: bytes) -> dict:
+    from deepface import DeepFace
+    import numpy as np
+    import cv2
+
+    doc = cv2.imdecode(np.frombuffer(document_image, dtype=np.uint8), cv2.IMREAD_COLOR)
+    selfie = cv2.imdecode(np.frombuffer(selfie_image, dtype=np.uint8), cv2.IMREAD_COLOR)
+    if doc is None or selfie is None:
+        raise ValueError("Imagem inválida")
+
+    result = DeepFace.verify(
+        img1_path=doc,
+        img2_path=selfie,
+        model_name="SFace",  # Somente teste: verificar licença dos pesos antes do uso comercial
+        detector_backend="opencv",
+        enforce_detection=True,
+        align=True,
+    )
+    return {
+        "match": bool(result["verified"]),
+        "distance": float(result["distance"]),
+        "threshold": float(result["threshold"]),
+        "status": "manual_review_required",
+        "warning": "Comparação facial não comprova autenticidade do documento ou vivacidade.",
+    }
+
+
+@api_router.post("/identity/verify-face")
+async def verify_face(
+    document: UploadFile = File(...),
+    selfie: UploadFile = File(...),
+    current_user: dict = Depends(get_current_user),
+):
+    for uploaded in (document, selfie):
+        if uploaded.content_type not in ("image/jpeg", "image/png"):
+            raise HTTPException(status_code=400, detail="Envie JPG ou PNG")
+
+    document_bytes = await document.read(FACE_MAX_BYTES + 1)
+    selfie_bytes = await selfie.read(FACE_MAX_BYTES + 1)
+    if not document_bytes or not selfie_bytes:
+        raise HTTPException(status_code=400, detail="Imagens vazias")
+    if len(document_bytes) > FACE_MAX_BYTES or len(selfie_bytes) > FACE_MAX_BYTES:
+        raise HTTPException(status_code=413, detail="Cada imagem deve ter até 5 MB")
+
+    try:
+        comparison = await run_in_threadpool(_verify_face_images, document_bytes, selfie_bytes)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Imagem inválida")
+    except Exception:
+        logger.exception("Falha na comparação facial")
+        raise HTTPException(status_code=422, detail="Não foi possível comparar os rostos. Confira as imagens")
+
+    return {"user_id": current_user["id"], **comparison}
+
+
 app.include_router(api_router)
 
 @app.on_event("startup")
