@@ -2219,30 +2219,92 @@ from starlette.concurrency import run_in_threadpool
 FACE_MAX_BYTES = 5 * 1024 * 1024
 
 
+# OpenCV YuNet + SFace, sem importar DeepFace.
+# Os modelos são baixados na primeira utilização e mantidos em /tmp durante a vida do contêiner.
+FACE_MODEL_DIR = Path(os.getenv("FACE_MODEL_DIR", "/tmp/resiq-face-models"))
+FACE_DETECTOR_URL = (
+    "https://raw.githubusercontent.com/opencv/opencv_zoo/main/models/"
+    "face_detection_yunet/face_detection_yunet_2023mar.onnx"
+)
+FACE_RECOGNIZER_URL = (
+    "https://raw.githubusercontent.com/opencv/opencv_zoo/main/models/"
+    "face_recognition_sface/face_recognition_sface_2021dec.onnx"
+)
+
+
+def _face_model_path(filename: str, url: str, min_size: int) -> str:
+    from urllib.request import urlopen
+    FACE_MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    target = FACE_MODEL_DIR / filename
+    if target.exists() and target.stat().st_size >= min_size:
+        return str(target)
+    temporary = target.with_suffix(".download")
+    try:
+        with urlopen(url, timeout=40) as response, open(temporary, "wb") as output:
+            while True:
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
+                output.write(chunk)
+        if temporary.stat().st_size < min_size:
+            raise RuntimeError("Modelo facial incompleto")
+        temporary.replace(target)
+        logger.info("Modelo facial preparado: %s", filename)
+        return str(target)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def _verify_face_images(document_image: bytes, selfie_image: bytes) -> dict:
-    from deepface import DeepFace
-    import numpy as np
     import cv2
+    import numpy as np
 
-    doc = cv2.imdecode(np.frombuffer(document_image, dtype=np.uint8), cv2.IMREAD_COLOR)
-    selfie = cv2.imdecode(np.frombuffer(selfie_image, dtype=np.uint8), cv2.IMREAD_COLOR)
-    if doc is None or selfie is None:
-        raise ValueError("Imagem inválida")
-
-    result = DeepFace.verify(
-        img1_path=doc,
-        img2_path=selfie,
-        model_name="SFace",  # Somente teste: verificar licença dos pesos antes do uso comercial
-        detector_backend="opencv",
-        enforce_detection=True,
-        align=True,
+    # Limitar o paralelismo para reduzir o pico de RAM no Render Free.
+    cv2.setNumThreads(1)
+    detector_path = _face_model_path(
+        "face_detection_yunet_2023mar.onnx", FACE_DETECTOR_URL, 100_000
     )
+    recognizer_path = _face_model_path(
+        "face_recognition_sface_2021dec.onnx", FACE_RECOGNIZER_URL, 10_000_000
+    )
+    detector = cv2.FaceDetectorYN.create(detector_path, "", (320, 320), 0.7, 0.3, 5000)
+    recognizer = cv2.FaceRecognizerSF.create(recognizer_path, "")
+
+    def extract_feature(image_bytes: bytes, label: str):
+        image = cv2.imdecode(np.frombuffer(image_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
+        if image is None:
+            raise ValueError("Imagem inválida")
+        h, w = image.shape[:2]
+        if h < 40 or w < 40:
+            raise ValueError("Imagem muito pequena")
+        # Redimensionamento antes da detecção evita grandes picos de memória.
+        scale = min(1.0, 960.0 / max(h, w))
+        if scale < 1:
+            image = cv2.resize(image, (max(1, int(w * scale)), max(1, int(h * scale))))
+        height, width = image.shape[:2]
+        detector.setInputSize((width, height))
+        _, faces = detector.detect(image)
+        if faces is None or len(faces) == 0:
+            raise ValueError(f"Rosto não encontrado na imagem: {label}")
+        if len(faces) != 1:
+            raise ValueError(f"A imagem deve conter somente um rosto: {label}")
+        aligned = recognizer.alignCrop(image, faces[0])
+        return recognizer.feature(aligned)
+
+    doc_feature = extract_feature(document_image, "documento")
+    selfie_feature = extract_feature(selfie_image, "selfie")
+    cosine_similarity = float(recognizer.match(
+        doc_feature, selfie_feature, cv2.FaceRecognizerSF_FR_COSINE
+    ))
+    # Referência do exemplo oficial OpenCV SFace (não calibrado para este público).
+    threshold = 0.363
     return {
-        "match": bool(result["verified"]),
-        "distance": float(result["distance"]),
-        "threshold": float(result["threshold"]),
+        "match": cosine_similarity >= threshold,
+        "distance": float(1.0 - cosine_similarity),
+        "threshold": float(1.0 - threshold),
+        "similarity": cosine_similarity,
         "status": "manual_review_required",
-        "warning": "Comparação facial não comprova autenticidade do documento ou vivacidade.",
+        "warning": "Resultado experimental; exige revisão humana. Não comprova documento autêntico nem prova de vida.",
     }
 
 
@@ -2265,10 +2327,10 @@ async def verify_face(
 
     try:
         comparison = await run_in_threadpool(_verify_face_images, document_bytes, selfie_bytes)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Imagem inválida")
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     except Exception:
-        logger.exception("Falha na comparação facial")
+        logger.exception("Falha na comparação facial (OpenCV)")
         raise HTTPException(status_code=422, detail="Não foi possível comparar os rostos. Confira as imagens")
 
     return {"user_id": current_user["id"], **comparison}
