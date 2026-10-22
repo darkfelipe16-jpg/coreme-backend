@@ -2223,11 +2223,11 @@ FACE_MAX_BYTES = 5 * 1024 * 1024
 # Os modelos são baixados na primeira utilização e mantidos em /tmp durante a vida do contêiner.
 FACE_MODEL_DIR = Path(os.getenv("FACE_MODEL_DIR", "/tmp/resiq-face-models"))
 FACE_DETECTOR_URL = (
-    "https://raw.githubusercontent.com/opencv/opencv_zoo/main/models/"
+    "https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/"
     "face_detection_yunet/face_detection_yunet_2023mar.onnx"
 )
 FACE_RECOGNIZER_URL = (
-    "https://raw.githubusercontent.com/opencv/opencv_zoo/main/models/"
+    "https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/"
     "face_recognition_sface/face_recognition_sface_2021dec.onnx"
 )
 
