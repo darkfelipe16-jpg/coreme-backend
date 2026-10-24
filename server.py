@@ -174,6 +174,7 @@ class UserResponse(BaseModel):
     coreme: Optional[str] = None
     created_at: datetime
     is_active: bool
+    identity_status: str = "not_started"
 
 
 class TokenResponse(BaseModel):
@@ -628,7 +629,8 @@ async def register(user_data: UserCreate):
         "scenario": user_data.scenario,
         "coreme": user_data.coreme,
         "created_at": datetime.utcnow(),
-        "is_active": True
+        "is_active": True,
+        "identity_status": "not_started"
     }
 
     await db.users.insert_one(user_dict)
@@ -648,7 +650,8 @@ async def register(user_data: UserCreate):
             scenario=user_dict.get("scenario"),
             coreme=user_dict.get("coreme"),
             created_at=user_dict["created_at"],
-            is_active=user_dict["is_active"]
+            is_active=user_dict["is_active"],
+            identity_status=user_dict.get("identity_status", "not_started")
         )
     )
 
@@ -681,7 +684,8 @@ async def login(credentials: UserLogin):
         scenario=user.get("scenario"),
         coreme=user.get("coreme"),
         created_at=user["created_at"],
-        is_active=user["is_active"]
+        is_active=user["is_active"],
+        identity_status=user.get("identity_status", "not_started")
     )
 )
 
@@ -699,7 +703,8 @@ async def get_me(current_user: dict = Depends(get_current_user)):
     scenario=current_user.get("scenario"),
     coreme=current_user.get("coreme"),
     created_at=current_user["created_at"],
-    is_active=current_user.get("is_active", True)
+    is_active=current_user.get("is_active", True),
+    identity_status=current_user.get("identity_status", "not_started")
 )
 
 
@@ -715,6 +720,12 @@ async def upload_pdf(
     current_user: dict = Depends(get_current_user)
 ):
     try:
+        if current_user.get("role") not in ("resident", "preceptor"):
+            raise HTTPException(status_code=403, detail="Envio exclusivo para residentes e preceptores")
+        # Validação no servidor: não confiar em bloqueio visual do aplicativo.
+        if current_user.get("identity_status") != "verified":
+            raise HTTPException(status_code=403, detail="Identidade ainda não verificada. Envio de frequência bloqueado")
+
         print("=== INICIO UPLOAD ===")
         print("file:", file.filename if file else None)
         print("aulas:", aulas_ministradas_file.filename if aulas_ministradas_file else None)
@@ -2308,12 +2319,86 @@ def _verify_face_images(document_image: bytes, selfie_image: bytes) -> dict:
     }
 
 
+@api_router.get("/identity/status")
+async def get_identity_status(current_user: dict = Depends(get_current_user)):
+    status = current_user.get("identity_status", "not_started")
+    return {"status": status, "verified": status == "verified"}
+
+
+class IdentityReviewRequest(BaseModel):
+    beneficiary_id: str
+    decision: str
+    reason: Optional[str] = None
+
+
+@api_router.get("/coreme/identity/pending")
+async def coreme_identity_pending(coreme_user: dict = Depends(get_coreme_user)):
+    return await db.users.find({
+        "role": {"$in": ["resident", "preceptor"]},
+        "coreme": coreme_user.get("full_name"),
+        "identity_status": "manual_review_required",
+        "is_active": True,
+    }, {"_id": 0, "id": 1, "full_name": 1, "role": 1, "program": 1,
+        "identity_status": 1, "identity_comparison": 1}).to_list(1000)
+
+
+@api_router.post("/coreme/identity/review")
+async def coreme_review_identity(
+    payload: IdentityReviewRequest,
+    coreme_user: dict = Depends(get_coreme_user),
+):
+    if payload.decision not in ("approve", "retry"):
+        raise HTTPException(status_code=400, detail="Decisão inválida")
+    reason = (payload.reason or "").strip()
+    if len(reason) < 15:
+        raise HTTPException(status_code=400, detail="Registre a justificativa e a conferência independente realizada (mínimo 15 caracteres)")
+    beneficiary = await db.users.find_one({
+        "id": payload.beneficiary_id,
+        "role": {"$in": ["resident", "preceptor"]},
+        "coreme": coreme_user.get("full_name"),
+        "is_active": True,
+        "identity_status": "manual_review_required",
+    })
+    if not beneficiary:
+        raise HTTPException(status_code=404, detail="Verificação pendente não encontrada nesta COREME")
+    comparison = beneficiary.get("identity_comparison") or {}
+    if payload.decision == "approve" and comparison.get("match") is not True:
+        raise HTTPException(status_code=409, detail="Comparação sem correspondência. Solicite nova tentativa")
+    now = datetime.utcnow()
+    new_status = "verified" if payload.decision == "approve" else "not_started"
+    result = await db.users.update_one(
+        {"id": beneficiary["id"], "identity_status": "manual_review_required"},
+        ({"$set": {"identity_status": new_status,
+                   "identity_reviewed_at": now,
+                   "identity_reviewed_by": coreme_user["id"]},
+          "$unset": {"identity_comparison": ""}} if new_status == "not_started"
+         else {"$set": {"identity_status": new_status,
+                        "identity_reviewed_at": now,
+                        "identity_reviewed_by": coreme_user["id"]}}),
+    )
+    if result.modified_count != 1:
+        raise HTTPException(status_code=409, detail="Estado alterado; atualize a página")
+    await db.audit_events.insert_one({
+        "id": str(uuid.uuid4()), "action": "identity_review",
+        "actor_id": coreme_user["id"], "beneficiary_id": beneficiary["id"],
+        "decision": payload.decision, "reason": reason, "at": now,
+    })
+    return {"ok": True, "status": new_status}
+
+
 @api_router.post("/identity/verify-face")
 async def verify_face(
     document: UploadFile = File(...),
     selfie: UploadFile = File(...),
     current_user: dict = Depends(get_current_user),
 ):
+    if current_user.get("role") not in ("resident", "preceptor"):
+        raise HTTPException(status_code=403, detail="Verificação facial exclusiva para residentes e preceptores")
+    if current_user.get("identity_status") == "verified":
+        raise HTTPException(status_code=409, detail="Identidade Verificada")
+    if current_user.get("identity_status") == "manual_review_required":
+        raise HTTPException(status_code=409, detail="Verificação aguardando análise da COREME")
+
     for uploaded in (document, selfie):
         if uploaded.content_type not in ("image/jpeg", "image/png"):
             raise HTTPException(status_code=400, detail="Envie JPG ou PNG")
@@ -2333,6 +2418,23 @@ async def verify_face(
         logger.exception("Falha na comparação facial (OpenCV)")
         raise HTTPException(status_code=422, detail="Não foi possível comparar os rostos. Confira as imagens")
 
+    # Uma submissão por vez: grava apenas o resultado técnico, não as imagens.
+    updated = await db.users.update_one(
+        {"id": current_user["id"],
+         "identity_status": {"$nin": ["verified", "manual_review_required"]}},
+        {"$set": {
+            "identity_status": "manual_review_required",
+            "identity_comparison": {
+                "match": comparison["match"],
+                "similarity": comparison.get("similarity"),
+                "distance": comparison.get("distance"),
+                "threshold": comparison.get("threshold"),
+                "submitted_at": datetime.utcnow(),
+            },
+        }},
+    )
+    if updated.modified_count != 1:
+        raise HTTPException(status_code=409, detail="Verificação já registrada ou aprovada")
     return {"user_id": current_user["id"], **comparison}
 
 
